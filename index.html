@@ -58,6 +58,8 @@
       const chatBtn = document.getElementById('chatBtn');
 
       let hasLoadedDocuments = false;
+      ingestBtn.disabled = true;
+      chatBtn.disabled = true;
 
       function appendChat(role, text = '') {
         const item = document.createElement('li');
@@ -85,6 +87,8 @@
       try {
         await engine.initialize();
         statusEl.textContent = 'Engine initialized. Upload or paste text, then submit.';
+        ingestBtn.disabled = false;
+        chatBtn.disabled = false;
       } catch (error) {
         statusEl.textContent = `Initialization error: ${error instanceof Error ? error.message : String(error)}`;
         ingestBtn.disabled = true;
@@ -97,10 +101,10 @@
 
         try {
           const file = sourceFileEl.files?.[0] ?? null;
-          const fileText = file ? await file.text() : '';
+          const fileText = file ? (await file.text()).trim() : '';
           const manualText = sourceTextEl.value.trim();
-          const combinedText = [manualText, fileText.trim()].filter(Boolean).join('\n\n');
-          const sourceCount = Number(Boolean(manualText)) + Number(Boolean(fileText.trim()));
+          const combinedText = [manualText, fileText].filter(Boolean).join('\n\n');
+          const sourceCount = Number(Boolean(manualText)) + Number(Boolean(fileText));
 
           if (!combinedText) {
             throw new Error('Provide text by file upload or pasted text before submitting.');
