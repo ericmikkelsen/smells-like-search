@@ -270,11 +270,15 @@ self.addEventListener('message', async (event) => {
           throw new Error('INIT already in progress with different configuration payload.');
         }
 
-        await state.initializing;
-
         if (ownsInit) {
-          state.initializing = null;
-          state.initializingPayloadKey = null;
+          try {
+            await state.initializing;
+          } finally {
+            state.initializing = null;
+            state.initializingPayloadKey = null;
+          }
+        } else {
+          await state.initializing;
         }
       }
       post('READY', { requestId });
@@ -305,8 +309,6 @@ self.addEventListener('message', async (event) => {
 
     throw new Error(`Unknown command type: ${type}`);
   } catch (error) {
-    state.initializing = null;
-    state.initializingPayloadKey = null;
     post('ERROR', {
       requestId,
       message: error instanceof Error ? error.message : String(error),

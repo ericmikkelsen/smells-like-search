@@ -72,7 +72,7 @@ function buildFeatures(ptr: usize, byteLength: i32, outFeatures: StaticArray<f32
 }
 
 function insertTop(score: f32, index: i32, winners: i32): void {
-  if (score <= unchecked(topScores[winners - 1])) return;
+  if (score < unchecked(topScores[winners - 1])) return;
 
   unchecked(topScores[winners - 1] = score);
   unchecked(topIndices[winners - 1] = index);
