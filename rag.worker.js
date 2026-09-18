@@ -298,23 +298,36 @@ async function ask(payload, requestId) {
 
   if (state.llmBackend === LLM_BACKEND.NANO) {
     // Chrome Prompt API — create a fresh per-question session to avoid context bleed.
+    // System prompt must be the first entry in initialPrompts per the Prompt API spec.
     let session;
     try {
-      session = await self.ai.languageModel.create({ systemPrompt: RAG_SYSTEM_PROMPT });
+      session = await self.ai.languageModel.create({
+        initialPrompts: [{ role: 'system', content: RAG_SYSTEM_PROMPT }],
+      });
     } catch (nanoError) {
       // Nano became unavailable (e.g. model unloaded); surface a clear error.
       throw new Error(`Gemini Nano session creation failed: ${nanoError instanceof Error ? nanoError.message : String(nanoError)}`);
     }
     try {
       const prompt = `Question:\n${question}\n\nRetrieved context:\n${context}`;
-      const stream = await session.promptStreaming(prompt);
+      // promptStreaming returns a ReadableStream that yields the cumulative response text.
+      // Diff against previousLength to extract each new incremental token.
+      const stream = session.promptStreaming(prompt);
+      const reader = stream.getReader();
       let previousLength = 0;
-      for await (const chunk of stream) {
-        const token = chunk.slice(previousLength);
-        previousLength = chunk.length;
-        if (!token) continue;
-        answer += token;
-        post('STREAM', { requestId, token });
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = typeof value === 'string' ? value : (value?.content ?? String(value ?? ''));
+          const token = chunk.slice(previousLength);
+          previousLength = chunk.length;
+          if (!token) continue;
+          answer += token;
+          post('STREAM', { requestId, token });
+        }
+      } finally {
+        reader.releaseLock();
       }
     } catch (streamError) {
       throw new Error(`Gemini Nano generation failed: ${streamError instanceof Error ? streamError.message : String(streamError)}`);
