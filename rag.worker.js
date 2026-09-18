@@ -6,14 +6,22 @@ const encoder = new TextEncoder();
 const MIN_COARSE_CANDIDATES = 8;
 const MAX_ASK_ATTEMPTS = 3;
 const TOPK_DEFAULT_SCHEDULE = [4, 8, 12];
-const GROUNDING_THRESHOLD = 0.72;
+const GROUNDING_THRESHOLD = 0.6;
 const CONTRADICTION_THRESHOLD = 0.7;
-const RELEVANCE_THRESHOLD = 0.15;
+const RELEVANCE_THRESHOLD = 0.08;
 const SAFE_REFUSAL_MAX_CHARS = 360;
 const COARSE_MULTIPLIER_BASE = 4;
 const COARSE_MULTIPLIER_STEP = 2;
 const COARSE_MULTIPLIER_MAX = 8;
 const COARSE_FLOOR_STEP = 4;
+const HYBRID_WEIGHT_DENSE = 0.45;
+const HYBRID_WEIGHT_LEXICAL = 0.30;
+const HYBRID_WEIGHT_FLY = 0.20;
+const HYBRID_WEIGHT_ENTITY = 0.05;
+const SALVAGE_GROUNDEDNESS_THRESHOLD = 0.55;
+const QUALITY_WEIGHT_GROUNDEDNESS = 0.5;
+const QUALITY_WEIGHT_RELEVANCE = 0.2;
+const QUALITY_WEIGHT_CONTRADICTION = 0.3;
 const EMBEDDING_MODEL_ID = 'Xenova/all-MiniLM-L6-v2';
 const GENERATION_MODEL_ID = 'Llama-3.2-3B-Instruct-q4f16_1-MLC';
 const RAG_SYSTEM_PROMPT =
@@ -161,11 +169,13 @@ function chunkText(source, size = 600, overlap = 100) {
   return chunks;
 }
 
-function rankByDenseSimilarity(queryEmbedding, candidates, topK) {
-  return candidates
-    .map((item) => ({ ...item, denseScore: cosine(queryEmbedding, item.embedding) }))
-    .sort((a, b) => b.denseScore - a.denseScore)
-    .slice(0, topK);
+function overlapRatio(querySet, textSet) {
+  if (!querySet.size) return 0;
+  let hits = 0;
+  querySet.forEach((token) => {
+    if (textSet.has(token)) hits += 1;
+  });
+  return hits / querySet.size;
 }
 
 function tokenize(text) {
@@ -212,6 +222,16 @@ function extractCapitalizedWords(text) {
     .filter((item) => !CAPITALIZED_IGNORE.has(item));
 }
 
+function extractEntityTerms(question) {
+  const entities = new Set(extractCapitalizedWords(question));
+  const quoted = String(question ?? '').match(/"([^"]{2,})"/g) ?? [];
+  for (const token of quoted) {
+    const clean = token.replaceAll('"', '').trim().toLowerCase();
+    if (clean) entities.add(clean);
+  }
+  return Array.from(entities);
+}
+
 function buildTopKSchedule(baseTopK) {
   const first = Math.max(1, toFiniteInt(baseTopK, TOPK_DEFAULT_SCHEDULE[0]));
   return [
@@ -239,6 +259,10 @@ function humanizeFailReason(reason) {
       return 'answer did not align closely enough with the question';
     case 'retrieval_saturated':
       return 'no additional relevant context was found after retrieval expansion';
+    case 'low_confidence_after_expansion':
+      return 'expanded retrieval still did not produce enough reliable support';
+    case 'quality_gate_failed':
+      return 'the generated answer did not pass quality checks';
     default:
       return 'answer quality did not meet grounding thresholds';
   }
@@ -261,7 +285,32 @@ async function retrieveContexts(query, topK, attemptIndex) {
     .slice(0, coarseLimit);
 
   const queryEmbedding = await embedText(query);
-  const reranked = rankByDenseSimilarity(queryEmbedding, coarse, topK);
+  const queryKeywordSet = toKeywordSet(query);
+  const entityTerms = extractEntityTerms(query);
+  const maxFlyScore = coarse.reduce((max, item) => Math.max(max, item.flyScore), 0);
+  const reranked = coarse
+    .map((item) => {
+      const denseScore = cosine(queryEmbedding, item.embedding);
+      const lexicalScore = overlapRatio(queryKeywordSet, item.keywordSet ?? toKeywordSet(item.text));
+      const normalizedFlyScore = maxFlyScore > 0 ? item.flyScore / maxFlyScore : 0;
+      const lowerText = item.lowerText ?? item.text.toLowerCase();
+      const entityMatches = entityTerms.filter((term) => lowerText.includes(term)).length;
+      const entityBoost = entityTerms.length ? entityMatches / entityTerms.length : 0;
+      const hybridScore = (denseScore * HYBRID_WEIGHT_DENSE)
+        + (lexicalScore * HYBRID_WEIGHT_LEXICAL)
+        + (normalizedFlyScore * HYBRID_WEIGHT_FLY)
+        + (entityBoost * HYBRID_WEIGHT_ENTITY);
+      return {
+        ...item,
+        denseScore,
+        lexicalScore,
+        normalizedFlyScore,
+        entityBoost,
+        hybridScore,
+      };
+    })
+    .sort((a, b) => b.hybridScore - a.hybridScore)
+    .slice(0, topK);
   return { reranked, coarseLimit };
 }
 
@@ -274,7 +323,11 @@ function buildContextString(reranked) {
 function evaluateAnswerQuality({ answer, question, contexts, attemptIndex }) {
   const answerKeywords = Array.from(toKeywordSet(answer));
   const questionKeywordSet = toKeywordSet(question);
-  const contextKeywordSet = toKeywordSet(contexts.map((item) => item.text).join('\n'));
+  const contextKeywordSet = new Set();
+  for (const item of contexts) {
+    const keywordSet = item.keywordSet ?? toKeywordSet(item.text);
+    keywordSet.forEach((token) => contextKeywordSet.add(token));
+  }
 
   const groundedness = ratioCovered(answerKeywords, contextKeywordSet);
   const relevance = ratioCovered(answerKeywords, questionKeywordSet);
@@ -494,7 +547,14 @@ async function loadDocuments(payload) {
     const chunk = chunks[i];
     const embedding = await embedText(chunk);
     const flyBits = flyHash(chunk);
-    embeddedChunks.push({ id: i, text: chunk, embedding, flyBits });
+    embeddedChunks.push({
+      id: i,
+      text: chunk,
+      lowerText: chunk.toLowerCase(),
+      keywordSet: toKeywordSet(chunk),
+      embedding,
+      flyBits,
+    });
     if ((i + 1) % 5 === 0 || i + 1 === total) {
       post('STATUS', { text: `Embedding chunk ${i + 1} of ${total}…` });
     }
@@ -523,6 +583,9 @@ async function ask(payload, requestId) {
   let finalContexts = [];
   let finalQuality = null;
   let stopReason = 'max_attempts_reached';
+  let bestAttempt = null;
+  let saturatedContexts = null;
+  let lastGeneratedContexts = [];
 
   for (let attemptIndex = 0; attemptIndex < MAX_ASK_ATTEMPTS; attemptIndex++) {
     const topK = topKSchedule[Math.min(attemptIndex, topKSchedule.length - 1)];
@@ -545,7 +608,7 @@ async function ask(payload, requestId) {
         newlyAddedContextCount: newlyAddedCount,
         quality: null,
       });
-      finalContexts = reranked;
+      saturatedContexts = reranked;
       finalQuality = {
         pass: false,
         failReason: 'retrieval_saturated',
@@ -580,7 +643,21 @@ async function ask(payload, requestId) {
     finalAnswer = answer;
     finalTokens = tokens;
     finalContexts = reranked;
+    lastGeneratedContexts = reranked;
     finalQuality = quality;
+    const scores = quality?.scores ?? { groundedness: 0, relevance: 0, contradiction: 0 };
+    const qualityScore = (scores.groundedness * QUALITY_WEIGHT_GROUNDEDNESS)
+      + (scores.relevance * QUALITY_WEIGHT_RELEVANCE)
+      + (scores.contradiction * QUALITY_WEIGHT_CONTRADICTION);
+    if (!bestAttempt || qualityScore > bestAttempt.qualityScore) {
+      bestAttempt = {
+        answer,
+        tokens,
+        contexts: reranked,
+        quality,
+        qualityScore,
+      };
+    }
 
     if (quality.pass) {
       stopReason = 'quality_passed';
@@ -594,8 +671,25 @@ async function ask(payload, requestId) {
     }
   }
 
-  if (!finalQuality?.pass) {
-    const reasonText = humanizeFailReason(stopReason === 'retrieval_saturated' ? 'retrieval_saturated' : (finalQuality?.failReason ?? ''));
+  const useBestAttemptFallback = Boolean(
+    stopReason === 'retrieval_saturated'
+    && bestAttempt
+    && bestAttempt.quality?.scores?.groundedness >= SALVAGE_GROUNDEDNESS_THRESHOLD
+    && bestAttempt.quality?.scores?.contradiction >= CONTRADICTION_THRESHOLD,
+  );
+
+  if (!finalQuality?.pass && useBestAttemptFallback) {
+    finalAnswer = bestAttempt.answer;
+    finalTokens = bestAttempt.tokens;
+    finalContexts = bestAttempt.contexts;
+    finalQuality = bestAttempt.quality;
+    stopReason = 'retrieval_saturated_used_best_attempt';
+  } else if (!finalQuality?.pass) {
+    finalContexts = lastGeneratedContexts.length
+      ? lastGeneratedContexts
+      : (saturatedContexts?.length ? saturatedContexts : finalContexts);
+    const reasonCode = finalQuality?.failReason ?? stopReason;
+    const reasonText = humanizeFailReason(reasonCode);
     finalAnswer = `I don’t have enough grounded context to answer that reliably. ${reasonText}. Please provide more source text or a more specific excerpt.`;
     finalTokens = [finalAnswer];
   }
@@ -609,6 +703,10 @@ async function ask(payload, requestId) {
       text: item.text,
       flyScore: item.flyScore,
       denseScore: item.denseScore,
+      lexicalScore: item.lexicalScore,
+      normalizedFlyScore: item.normalizedFlyScore,
+      entityBoost: item.entityBoost,
+      hybridScore: item.hybridScore,
     })),
     debug: {
       attempts: attemptDebug,

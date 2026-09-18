@@ -48,6 +48,7 @@
       const progressEl = document.getElementById('progress');
       const statusEl = document.getElementById('status');
       const chatListEl = document.getElementById('chatList');
+      const showDebug = new URLSearchParams(window.location.search).get('debug') === '1';
 
       const ingestForm = document.getElementById('ingestForm');
       const sourceFileEl = document.getElementById('sourceFile');
@@ -119,7 +120,7 @@
           lines.push('Returned contexts');
           contexts.forEach((ctx, idx) => {
             lines.push(
-              `Context ${idx + 1} (id=${ctx.id ?? 'n/a'}) fly=${formatScore(ctx.flyScore)} dense=${formatScore(ctx.denseScore)}: ${compactText(ctx.text)}`,
+              `Context ${idx + 1} (id=${ctx.id ?? 'n/a'}) hybrid=${formatScore(ctx.hybridScore)} dense=${formatScore(ctx.denseScore)} lexical=${formatScore(ctx.lexicalScore)} fly=${formatScore(ctx.flyScore)} flyNorm=${formatScore(ctx.normalizedFlyScore)} entityBoost=${formatScore(ctx.entityBoost)}: ${compactText(ctx.text)}`,
             );
           });
         }
@@ -209,11 +210,13 @@
             answerEl.textContent = '(No answer generated.)';
           }
           const debugSummary = buildDebugSummary(result);
-          if (debugSummary) {
+          if (showDebug && debugSummary) {
             const debugEl = document.createElement('pre');
             debugEl.className = 'debug';
             debugEl.textContent = debugSummary;
-            answerEl.parentElement.appendChild(debugEl);
+            if (answerEl.parentElement) {
+              answerEl.parentElement.appendChild(debugEl);
+            }
           }
         } catch (error) {
           answerEl.textContent = `Error: ${error instanceof Error ? error.message : String(error)}`;
