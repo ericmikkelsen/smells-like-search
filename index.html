@@ -7,33 +7,73 @@
     <style>
       body { font-family: system-ui, sans-serif; margin: 24px; max-width: 900px; }
       textarea, input { width: 100%; box-sizing: border-box; margin: 8px 0 16px; }
-      textarea { min-height: 220px; }
+      textarea { min-height: 160px; }
+      form { border: 1px solid #ddd; padding: 12px; margin-bottom: 16px; }
       button { padding: 8px 16px; }
-      #output { white-space: pre-wrap; border: 1px solid #ccc; padding: 12px; min-height: 160px; }
+      #status { white-space: pre-wrap; border: 1px solid #ccc; padding: 12px; min-height: 40px; margin-bottom: 16px; }
+      #chatList { list-style: none; padding: 0; margin: 0; border: 1px solid #ccc; min-height: 160px; }
+      #chatList li { border-top: 1px solid #eee; padding: 10px 12px; white-space: pre-wrap; }
+      #chatList li:first-child { border-top: 0; }
+      .role { font-weight: 600; display: block; margin-bottom: 4px; }
     </style>
   </head>
   <body>
     <h1>FlyRAGSearchEngine POC</h1>
 
-    <label for="sourceText">Sample text corpus</label>
-    <textarea id="sourceText" placeholder="Paste source text to index for retrieval..."></textarea>
+    <form id="ingestForm">
+      <label for="sourceFile">Upload text file</label>
+      <input id="sourceFile" type="file" accept=".txt,.md,.text,text/plain" />
 
-    <label for="question">Question</label>
-    <input id="question" type="text" placeholder="Ask a question about the indexed text" />
+      <label for="sourceText">Or paste source text</label>
+      <textarea id="sourceText" placeholder="Paste source text to index for retrieval..."></textarea>
 
-    <button id="runBtn">Load + Ask</button>
+      <button id="ingestBtn" type="submit">Submit Text</button>
+    </form>
+
+    <form id="chatForm">
+      <label for="chatInput">Message</label>
+      <textarea id="chatInput" placeholder="Ask a question about the uploaded/indexed text"></textarea>
+      <button id="chatBtn" type="submit">Send Message</button>
+    </form>
+
     <p>Model load progress: <strong id="progress">0%</strong></p>
+    <div id="status"></div>
 
-    <div id="output"></div>
+    <ul id="chatList" aria-live="polite"></ul>
 
     <script type="module">
       import FlyRAGSearchEngine from './FlyRAGSearchEngine.js';
 
       const progressEl = document.getElementById('progress');
-      const outputEl = document.getElementById('output');
-      const sourceEl = document.getElementById('sourceText');
-      const questionEl = document.getElementById('question');
-      const runBtn = document.getElementById('runBtn');
+      const statusEl = document.getElementById('status');
+      const chatListEl = document.getElementById('chatList');
+
+      const ingestForm = document.getElementById('ingestForm');
+      const sourceFileEl = document.getElementById('sourceFile');
+      const sourceTextEl = document.getElementById('sourceText');
+      const ingestBtn = document.getElementById('ingestBtn');
+
+      const chatForm = document.getElementById('chatForm');
+      const chatInputEl = document.getElementById('chatInput');
+      const chatBtn = document.getElementById('chatBtn');
+
+      let hasLoadedDocuments = false;
+
+      function appendChat(role, text = '') {
+        const item = document.createElement('li');
+        const roleEl = document.createElement('span');
+        const textEl = document.createElement('span');
+
+        roleEl.className = 'role';
+        roleEl.textContent = role;
+        textEl.textContent = text;
+
+        item.append(roleEl, textEl);
+        chatListEl.appendChild(item);
+        item.scrollIntoView({ behavior: 'smooth', block: 'end' });
+
+        return textEl;
+      }
 
       const engine = new FlyRAGSearchEngine({
         quiet: false,
@@ -44,31 +84,69 @@
 
       try {
         await engine.initialize();
+        statusEl.textContent = 'Engine initialized. Upload or paste text, then submit.';
       } catch (error) {
-        outputEl.textContent = `Initialization error: ${error instanceof Error ? error.message : String(error)}`;
-        runBtn.disabled = true;
+        statusEl.textContent = `Initialization error: ${error instanceof Error ? error.message : String(error)}`;
+        ingestBtn.disabled = true;
+        chatBtn.disabled = true;
       }
 
-      runBtn.addEventListener('click', async () => {
-        outputEl.textContent = '';
-        runBtn.disabled = true;
+      ingestForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        ingestBtn.disabled = true;
 
         try {
-          await engine.loadDocuments(sourceEl.value);
-          const result = await engine.ask(questionEl.value, {
+          const file = sourceFileEl.files?.[0] ?? null;
+          const fileText = file ? await file.text() : '';
+          const manualText = sourceTextEl.value.trim();
+          const combinedText = [manualText, fileText.trim()].filter(Boolean).join('\n\n');
+
+          if (!combinedText) {
+            throw new Error('Provide text by file upload or pasted text before submitting.');
+          }
+
+          const chunkCount = await engine.loadDocuments(combinedText);
+          hasLoadedDocuments = true;
+          statusEl.textContent = `Loaded ${chunkCount} chunks. You can now send chat messages.`;
+        } catch (error) {
+          statusEl.textContent = `Load error: ${error instanceof Error ? error.message : String(error)}`;
+        } finally {
+          ingestBtn.disabled = false;
+        }
+      });
+
+      chatForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+
+        const question = chatInputEl.value.trim();
+        if (!question) return;
+
+        appendChat('User', question);
+        chatInputEl.value = '';
+
+        if (!hasLoadedDocuments) {
+          appendChat('Assistant', 'Please submit source text first.');
+          return;
+        }
+
+        chatBtn.disabled = true;
+        const answerEl = appendChat('Assistant', '');
+
+        try {
+          const result = await engine.ask(question, {
             topK: 4,
             onToken(token) {
-              outputEl.textContent += token;
+              answerEl.textContent += token;
             },
           });
 
           if (!result.answer) {
-            outputEl.textContent = '(No answer generated.)';
+            answerEl.textContent = '(No answer generated.)';
           }
         } catch (error) {
-          outputEl.textContent = `Error: ${error instanceof Error ? error.message : String(error)}`;
+          answerEl.textContent = `Error: ${error instanceof Error ? error.message : String(error)}`;
         } finally {
-          runBtn.disabled = false;
+          chatBtn.disabled = false;
         }
       });
     </script>
