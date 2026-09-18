@@ -128,7 +128,7 @@ function overlapBits(a: StaticArray<u32>, b: StaticArray<u32>): i32 {
 
   for (let i: i32 = 0; i < words; i++) {
     let bits = unchecked(a[i] & b[i]);
-    overlap += popcnt(bits);
+    overlap += popcnt<u32>(bits);
   }
 
   return overlap;

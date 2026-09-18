@@ -15,10 +15,14 @@ export class FlyRAGSearchEngine {
       if (!this.quiet) console.error('[FlyRAGSearchEngine] Worker error:', error);
     });
 
-    this.ready = this.#send('INIT', { quiet: this.quiet, wasmUrl, flyHashConfig });
+    this.initPayload = { quiet: this.quiet, wasmUrl, flyHashConfig };
+    this.ready = this.#startInit();
   }
 
-  async initialize() {
+  async initialize({ retry = false } = {}) {
+    if (retry) {
+      this.ready = this.#startInit();
+    }
     await this.ready;
   }
 
@@ -57,6 +61,10 @@ export class FlyRAGSearchEngine {
 
   #send(type, payload) {
     return this.#sendWithId(this.#nextRequestId(), type, payload);
+  }
+
+  #startInit() {
+    return this.#send('INIT', this.initPayload);
   }
 
   #nextRequestId() {

@@ -125,39 +125,52 @@ function rankByDenseSimilarity(queryEmbedding, candidates, topK) {
 
 async function initialize(payload) {
   state.quiet = Boolean(payload?.quiet);
-  post('PROGRESS', { percent: 1 });
+  try {
+    post('PROGRESS', { percent: 1 });
 
-  const wasmExports = await initWasm(payload?.wasmUrl);
-  if (payload?.flyHashConfig) {
-    const cfg = payload.flyHashConfig;
-    wasmExports.configure(
-      toFiniteInt(cfg.hashBits, 512),
-      toFiniteInt(cfg.winners, 48),
-      toFiniteInt(cfg.projections, 6),
-      toFiniteInt(cfg.seed, 0xC0FFEE) >>> 0,
-    );
+    const wasmExports = await initWasm(payload?.wasmUrl);
+    if (payload?.flyHashConfig) {
+      const cfg = payload.flyHashConfig;
+      wasmExports.configure(
+        toFiniteInt(cfg.hashBits, 512),
+        toFiniteInt(cfg.winners, 48),
+        toFiniteInt(cfg.projections, 6),
+        toFiniteInt(cfg.seed, 0xC0FFEE) >>> 0,
+      );
+    }
+    post('PROGRESS', { percent: 12 });
+
+    state.embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
+      progress_callback(progress) {
+        if (progress?.total == null || progress?.loaded == null || progress.total <= 0) return;
+        const ratio = progress.loaded / progress.total;
+        post('PROGRESS', { percent: toPercent(ratio, 12, 72) });
+      },
+    });
+
+    post('PROGRESS', { percent: 74 });
+
+    state.llm = await webllm.CreateMLCEngine('Llama-3.2-1B-Instruct-q4f16_1-MLC', {
+      initProgressCallback(progress) {
+        const ratio = typeof progress?.progress === 'number' ? progress.progress : 0;
+        post('PROGRESS', { percent: toPercent(ratio, 74, 100) });
+      },
+    });
+
+    state.initialized = true;
+    post('PROGRESS', { percent: 100 });
+  } catch (error) {
+    state.initialized = false;
+    state.wasm = null;
+    state.memory = null;
+    state.queryPtr = 0;
+    state.candidatePtr = 0;
+    state.bufferCapacity = 0;
+    state.embedder = null;
+    state.llm = null;
+    state.chunks = [];
+    throw error;
   }
-  post('PROGRESS', { percent: 12 });
-
-  state.embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
-    progress_callback(progress) {
-      if (!progress?.total || !progress?.loaded) return;
-      const ratio = progress.loaded / progress.total;
-      post('PROGRESS', { percent: toPercent(ratio, 12, 72) });
-    },
-  });
-
-  post('PROGRESS', { percent: 74 });
-
-  state.llm = await webllm.CreateMLCEngine('Llama-3.2-1B-Instruct-q4f16_1-MLC', {
-    initProgressCallback(progress) {
-      const ratio = typeof progress?.progress === 'number' ? progress.progress : 0;
-      post('PROGRESS', { percent: toPercent(ratio, 74, 100) });
-    },
-  });
-
-  state.initialized = true;
-  post('PROGRESS', { percent: 100 });
 }
 
 async function loadDocuments(payload) {
