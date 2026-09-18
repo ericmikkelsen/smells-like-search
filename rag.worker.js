@@ -4,6 +4,8 @@ import * as webllm from 'https://esm.run/@mlc-ai/web-llm';
 const CHANNEL = 'FLYRAG_CORE';
 const encoder = new TextEncoder();
 const MIN_COARSE_CANDIDATES = 8;
+const EMBEDDING_MODEL_ID = 'Xenova/all-MiniLM-L6-v2';
+const GENERATION_MODEL_ID = 'Llama-3.2-1B-Instruct-q4f16_1-MLC';
 
 const state = {
   quiet: false,
@@ -142,7 +144,7 @@ async function initialize(payload) {
     }
     post('PROGRESS', { percent: 12 });
 
-    state.embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
+    state.embedder = await pipeline('feature-extraction', EMBEDDING_MODEL_ID, {
       progress_callback(progress) {
         if (progress?.total == null || progress?.loaded == null || progress.total <= 0) return;
         const ratio = progress.loaded / progress.total;
@@ -152,7 +154,7 @@ async function initialize(payload) {
 
     post('PROGRESS', { percent: 74 });
 
-    state.llm = await webllm.CreateMLCEngine('Llama-3.2-1B-Instruct-q4f16_1-MLC', {
+    state.llm = await webllm.CreateMLCEngine(GENERATION_MODEL_ID, {
       initProgressCallback(progress) {
         const ratio = typeof progress?.progress === 'number' ? progress.progress : 0;
         post('PROGRESS', { percent: toPercent(ratio, 74, 100) });

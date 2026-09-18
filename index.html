@@ -100,6 +100,7 @@
           const fileText = file ? await file.text() : '';
           const manualText = sourceTextEl.value.trim();
           const combinedText = [manualText, fileText.trim()].filter(Boolean).join('\n\n');
+          const sourceCount = Number(Boolean(manualText)) + Number(Boolean(fileText.trim()));
 
           if (!combinedText) {
             throw new Error('Provide text by file upload or pasted text before submitting.');
@@ -107,7 +108,9 @@
 
           const chunkCount = await engine.loadDocuments(combinedText);
           hasLoadedDocuments = true;
-          statusEl.textContent = `Loaded ${chunkCount} chunks. You can now send chat messages.`;
+          statusEl.textContent = `Loaded ${chunkCount} chunks from ${sourceCount} source${sourceCount === 1 ? '' : 's'}. You can now send chat messages.`;
+          sourceTextEl.value = '';
+          sourceFileEl.value = '';
         } catch (error) {
           statusEl.textContent = `Load error: ${error instanceof Error ? error.message : String(error)}`;
         } finally {
