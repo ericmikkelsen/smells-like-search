@@ -22,8 +22,8 @@ export class FlyRAGSearchEngine {
   }
 
   async initialize({ retry = this.initFailed } = {}) {
-    if (retry && this.initFailed && !this.isInitializing) {
-      this.ready = this.#startInit();
+    if (retry && this.initFailed) {
+      this.#startInit();
     }
     await this.ready;
   }
@@ -66,8 +66,12 @@ export class FlyRAGSearchEngine {
   }
 
   #startInit() {
+    if (this.isInitializing) {
+      return this.ready;
+    }
+
     this.isInitializing = true;
-    return this.#send('INIT', this.initPayload)
+    const initPromise = this.#send('INIT', this.initPayload)
       .then((result) => {
         this.initFailed = false;
         return result;
@@ -79,6 +83,8 @@ export class FlyRAGSearchEngine {
       .finally(() => {
         this.isInitializing = false;
       });
+    this.ready = initPromise;
+    return initPromise;
   }
 
   #nextRequestId() {

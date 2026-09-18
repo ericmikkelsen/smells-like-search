@@ -261,24 +261,21 @@ self.addEventListener('message', async (event) => {
     if (type === 'INIT') {
       const payloadKey = JSON.stringify(payload ?? {});
       if (!state.initialized) {
-        let ownsInit = false;
         if (!state.initializing) {
           state.initializingPayloadKey = payloadKey;
           state.initializing = initialize(payload);
-          ownsInit = true;
         } else if (state.initializingPayloadKey !== payloadKey) {
           throw new Error('INIT already in progress with different configuration payload.');
         }
 
-        if (ownsInit) {
-          try {
-            await state.initializing;
-          } finally {
+        const initPromise = state.initializing;
+        try {
+          await initPromise;
+        } finally {
+          if (state.initializing === initPromise) {
             state.initializing = null;
             state.initializingPayloadKey = null;
           }
-        } else {
-          await state.initializing;
         }
       }
       post('READY', { requestId });
