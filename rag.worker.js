@@ -6,6 +6,14 @@ const encoder = new TextEncoder();
 const MIN_COARSE_CANDIDATES = 8;
 const MAX_ASK_ATTEMPTS = 3;
 const TOPK_DEFAULT_SCHEDULE = [4, 8, 12];
+const GROUNDING_THRESHOLD = 0.72;
+const CONTRADICTION_THRESHOLD = 0.7;
+const RELEVANCE_THRESHOLD = 0.15;
+const SAFE_REFUSAL_MAX_CHARS = 360;
+const COARSE_MULTIPLIER_BASE = 4;
+const COARSE_MULTIPLIER_STEP = 2;
+const COARSE_MULTIPLIER_MAX = 8;
+const COARSE_FLOOR_STEP = 4;
 const EMBEDDING_MODEL_ID = 'Xenova/all-MiniLM-L6-v2';
 const GENERATION_MODEL_ID = 'Llama-3.2-3B-Instruct-q4f16_1-MLC';
 const RAG_SYSTEM_PROMPT =
@@ -175,7 +183,7 @@ const STOP_WORDS = new Set([
 
 const CAPITALIZED_IGNORE = new Set([
   ...STOP_WORDS,
-  'based', 'according', 'assistant', 'user', 'question', 'contexts', 'context', 'retrieved',
+  'based', 'according', 'assistant', 'user', 'question', 'contexts', 'retrieved',
   'insufficient', 'please', 'reason', 'related', 'terms',
 ]);
 
@@ -229,6 +237,8 @@ function humanizeFailReason(reason) {
       return 'retrieved context did not provide enough direct support';
     case 'low_relevance':
       return 'answer did not align closely enough with the question';
+    case 'retrieval_saturated':
+      return 'no additional relevant context was found after retrieval expansion';
     default:
       return 'answer quality did not meet grounding thresholds';
   }
@@ -242,8 +252,8 @@ async function emitTokenStream(requestId, tokens) {
 }
 
 async function retrieveContexts(query, topK, attemptIndex) {
-  const coarseMultiplier = Math.min(8, 4 + attemptIndex * 2);
-  const coarseFloor = MIN_COARSE_CANDIDATES + attemptIndex * 4;
+  const coarseMultiplier = Math.min(COARSE_MULTIPLIER_MAX, COARSE_MULTIPLIER_BASE + attemptIndex * COARSE_MULTIPLIER_STEP);
+  const coarseFloor = MIN_COARSE_CANDIDATES + attemptIndex * COARSE_FLOOR_STEP;
   const coarseLimit = Math.min(state.chunks.length, Math.max(topK * coarseMultiplier, coarseFloor));
 
   const coarse = flyScoreAllChunks(query, state.chunks)
@@ -279,19 +289,23 @@ function evaluateAnswerQuality({ answer, question, contexts, attemptIndex }) {
   const contradictionScore = 1 - contradictionRisk;
 
   const insufficientCue = hasInsufficientCue(answer);
-  const uncertainOrLowGrounding = groundedness < 0.72;
+  const uncertainOrLowGrounding = groundedness < GROUNDING_THRESHOLD;
   const uncertaintyHandled = !uncertainOrLowGrounding || insufficientCue;
 
-  const lowEvidenceSafeRefusal = insufficientCue && contradictionScore >= 0.7 && answer.length <= 360;
-  const passesGrounding = groundedness >= 0.72 && contradictionScore >= 0.7 && relevance >= 0.15;
+  const lowEvidenceSafeRefusal = insufficientCue
+    && contradictionScore >= CONTRADICTION_THRESHOLD
+    && answer.length <= SAFE_REFUSAL_MAX_CHARS;
+  const passesGrounding = groundedness >= GROUNDING_THRESHOLD
+    && contradictionScore >= CONTRADICTION_THRESHOLD
+    && relevance >= RELEVANCE_THRESHOLD;
 
   const pass = passesGrounding || lowEvidenceSafeRefusal;
   let failReason = '';
   if (!pass) {
     if (!uncertaintyHandled) failReason = 'missing_uncertainty';
-    else if (contradictionScore < 0.7) failReason = 'possible_hallucination';
-    else if (groundedness < 0.72) failReason = 'low_groundedness';
-    else if (relevance < 0.15) failReason = 'low_relevance';
+    else if (contradictionScore < CONTRADICTION_THRESHOLD) failReason = 'possible_hallucination';
+    else if (groundedness < GROUNDING_THRESHOLD) failReason = 'low_groundedness';
+    else if (relevance < RELEVANCE_THRESHOLD) failReason = 'low_relevance';
     else failReason = 'quality_gate_failed';
   }
 
@@ -350,6 +364,7 @@ async function generateAnswer(question, context) {
     } finally {
       session.destroy();
     }
+    if (!tokens.length && answer) tokens.push(answer);
     return { answer, tokens };
   }
 
@@ -374,6 +389,7 @@ async function generateAnswer(question, context) {
     answer += token;
   }
 
+  if (!tokens.length && answer) tokens.push(answer);
   return { answer, tokens };
 }
 
@@ -517,6 +533,28 @@ async function ask(payload, requestId) {
     const contextIds = reranked.map((item) => item.id);
 
     const newlyAddedCount = contextIds.filter((id) => !seenContextIds.has(id)).length;
+    const retrievalSaturated = attemptIndex > 0 && newlyAddedCount === 0;
+
+    if (retrievalSaturated) {
+      attemptDebug.push({
+        attempt: attemptIndex + 1,
+        retrievalQuestion,
+        topK,
+        coarseLimit,
+        contextIds,
+        newlyAddedContextCount: newlyAddedCount,
+        quality: null,
+      });
+      finalContexts = reranked;
+      finalQuality = {
+        pass: false,
+        failReason: 'retrieval_saturated',
+        scores: null,
+      };
+      stopReason = 'retrieval_saturated';
+      break;
+    }
+
     for (const id of contextIds) {
       seenContextIds.add(id);
     }
@@ -549,12 +587,7 @@ async function ask(payload, requestId) {
       break;
     }
 
-    const retrievalSaturated = attemptIndex > 0 && attemptIndex < MAX_ASK_ATTEMPTS - 1 && newlyAddedCount === 0;
     const lastAttempt = attemptIndex === MAX_ASK_ATTEMPTS - 1;
-    if (retrievalSaturated) {
-      stopReason = 'retrieval_saturated';
-      break;
-    }
     if (lastAttempt) {
       stopReason = 'low_confidence_after_expansion';
       break;
@@ -562,12 +595,8 @@ async function ask(payload, requestId) {
   }
 
   if (!finalQuality?.pass) {
-    const reasonText = humanizeFailReason(finalQuality?.failReason ?? '');
+    const reasonText = humanizeFailReason(stopReason === 'retrieval_saturated' ? 'retrieval_saturated' : (finalQuality?.failReason ?? ''));
     finalAnswer = `I don’t have enough grounded context to answer that reliably. ${reasonText}. Please provide more source text or a more specific excerpt.`;
-    finalTokens = [finalAnswer];
-  }
-
-  if (!finalTokens.length) {
     finalTokens = [finalAnswer];
   }
 

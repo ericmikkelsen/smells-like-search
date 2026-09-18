@@ -15,6 +15,7 @@
       #chatList li { border-top: 1px solid #eee; padding: 10px 12px; white-space: pre-wrap; }
       #chatList li:first-child { border-top: 0; }
       .role { font-weight: 600; display: block; margin-bottom: 4px; }
+      .debug { margin-top: 12px; padding: 10px; border: 1px dashed #bbb; background: #fafafa; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     </style>
   </head>
   <body>
@@ -75,6 +76,55 @@
         item.scrollIntoView({ behavior: 'smooth', block: 'end' });
 
         return textEl;
+      }
+
+      function formatScore(value) {
+        if (typeof value !== 'number' || !Number.isFinite(value)) return 'n/a';
+        return value.toFixed(3);
+      }
+
+      function compactText(text, limit = 260) {
+        const raw = String(text ?? '').replace(/\s+/g, ' ').trim();
+        if (raw.length <= limit) return raw;
+        return `${raw.slice(0, limit)}…`;
+      }
+
+      function buildDebugSummary(result) {
+        if (!result) return '';
+        const lines = [];
+        const debug = result.debug ?? {};
+        const contexts = Array.isArray(result.contexts) ? result.contexts : [];
+        const attempts = Array.isArray(debug.attempts) ? debug.attempts : [];
+
+        lines.push('Retrieval debug');
+        lines.push(`stopReason: ${debug.stopReason ?? 'n/a'}`);
+        lines.push(`qualityPass: ${String(Boolean(debug.passedQualityGate))}`);
+        if (debug.finalScores) {
+          lines.push(
+            `finalScores: grounded=${formatScore(debug.finalScores.groundedness)} relevance=${formatScore(debug.finalScores.relevance)} contradiction=${formatScore(debug.finalScores.contradiction)} uncertaintyHandled=${String(Boolean(debug.finalScores.uncertaintyHandled))}`,
+          );
+        }
+        if (attempts.length) {
+          lines.push('');
+          lines.push('Attempts');
+          for (const attempt of attempts) {
+            const scores = attempt.quality?.scores ?? {};
+            lines.push(
+              `#${attempt.attempt}: topK=${attempt.topK} coarse=${attempt.coarseLimit} ids=[${(attempt.contextIds ?? []).join(', ')}] new=${attempt.newlyAddedContextCount} pass=${String(Boolean(attempt.quality?.pass))} grounded=${formatScore(scores.groundedness)} relevance=${formatScore(scores.relevance)} contradiction=${formatScore(scores.contradiction)}`,
+            );
+          }
+        }
+        if (contexts.length) {
+          lines.push('');
+          lines.push('Returned contexts');
+          contexts.forEach((ctx, idx) => {
+            lines.push(
+              `Context ${idx + 1} (id=${ctx.id ?? 'n/a'}) fly=${formatScore(ctx.flyScore)} dense=${formatScore(ctx.denseScore)}: ${compactText(ctx.text)}`,
+            );
+          });
+        }
+
+        return lines.join('\n');
       }
 
       let receivedStatus = false;
@@ -157,6 +207,13 @@
 
           if (!result.answer) {
             answerEl.textContent = '(No answer generated.)';
+          }
+          const debugSummary = buildDebugSummary(result);
+          if (debugSummary) {
+            const debugEl = document.createElement('pre');
+            debugEl.className = 'debug';
+            debugEl.textContent = debugSummary;
+            answerEl.parentElement.appendChild(debugEl);
           }
         } catch (error) {
           answerEl.textContent = `Error: ${error instanceof Error ? error.message : String(error)}`;
