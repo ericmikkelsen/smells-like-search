@@ -1,0 +1,115 @@
+const CHANNEL = 'FLYRAG_CORE';
+
+export class FlyRAGSearchEngine {
+  constructor({ quiet = false, workerUrl = './rag.worker.js', onProgress } = {}) {
+    this.quiet = Boolean(quiet);
+    this.onProgress = typeof onProgress === 'function' ? onProgress : null;
+    this.worker = new Worker(workerUrl, { type: 'module' });
+
+    this.requestId = 1;
+    this.pending = new Map();
+    this.streamHandlers = new Map();
+
+    this.worker.addEventListener('message', (event) => this.#handleMessage(event.data));
+    this.worker.addEventListener('error', (error) => {
+      if (!this.quiet) console.error('[FlyRAGSearchEngine] Worker error:', error);
+    });
+
+    this.ready = this.#send('INIT', { quiet: this.quiet });
+  }
+
+  async initialize() {
+    await this.ready;
+  }
+
+  async loadDocuments(text) {
+    await this.ready;
+    const result = await this.#send('LOAD_DOCUMENTS', { text: text ?? '' });
+    return result.chunkCount;
+  }
+
+  async ask(question, { topK = 4, onToken } = {}) {
+    await this.ready;
+
+    const requestId = this.requestId++;
+    if (typeof onToken === 'function') {
+      this.streamHandlers.set(requestId, onToken);
+    }
+
+    try {
+      return await this.#sendWithId(requestId, 'ASK', { question, topK });
+    } finally {
+      this.streamHandlers.delete(requestId);
+    }
+  }
+
+  async reset() {
+    await this.ready;
+    await this.#send('RESET', {});
+  }
+
+  dispose() {
+    this.pending.forEach(({ reject }) => reject(new Error('FlyRAGSearchEngine disposed.')));
+    this.pending.clear();
+    this.streamHandlers.clear();
+    this.worker.terminate();
+  }
+
+  #send(type, payload) {
+    return this.#sendWithId(this.requestId++, type, payload);
+  }
+
+  #sendWithId(requestId, type, payload) {
+    const promise = new Promise((resolve, reject) => {
+      this.pending.set(requestId, { resolve, reject });
+    });
+
+    this.worker.postMessage({
+      channel: CHANNEL,
+      type,
+      requestId,
+      payload,
+    });
+
+    return promise;
+  }
+
+  #handleMessage(message) {
+    if (!message || message.channel !== CHANNEL) return;
+
+    if (message.type === 'PROGRESS') {
+      if (this.onProgress) this.onProgress({ type: 'PROGRESS', percent: Number(message.percent ?? 0) });
+      return;
+    }
+
+    if (message.type === 'STREAM') {
+      const onToken = this.streamHandlers.get(message.requestId);
+      if (onToken) onToken(message.token ?? '');
+      return;
+    }
+
+    const pending = this.pending.get(message.requestId);
+    if (!pending) return;
+
+    this.pending.delete(message.requestId);
+
+    if (message.type === 'ERROR') {
+      pending.reject(new Error(message.message || 'Unknown worker error'));
+      return;
+    }
+
+    if (message.type === 'READY') {
+      pending.resolve({ ok: true });
+      return;
+    }
+
+    if (message.type === 'RESULT') {
+      pending.resolve(message.result);
+      return;
+    }
+
+    pending.reject(new Error(`Unknown worker response type: ${message.type}`));
+  }
+}
+
+export default FlyRAGSearchEngine;

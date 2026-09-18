@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FlyRAGSearchEngine POC</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 24px; max-width: 900px; }
+      textarea, input { width: 100%; box-sizing: border-box; margin: 8px 0 16px; }
+      textarea { min-height: 220px; }
+      button { padding: 8px 16px; }
+      #output { white-space: pre-wrap; border: 1px solid #ccc; padding: 12px; min-height: 160px; }
+    </style>
+  </head>
+  <body>
+    <h1>FlyRAGSearchEngine POC</h1>
+
+    <label for="sourceText">Sample text corpus</label>
+    <textarea id="sourceText" placeholder="Paste source text to index for retrieval..."></textarea>
+
+    <label for="question">Question</label>
+    <input id="question" type="text" placeholder="Ask a question about the indexed text" />
+
+    <button id="runBtn">Load + Ask</button>
+    <p>Model load progress: <strong id="progress">0%</strong></p>
+
+    <div id="output"></div>
+
+    <script type="module">
+      import FlyRAGSearchEngine from './FlyRAGSearchEngine.js';
+
+      const progressEl = document.getElementById('progress');
+      const outputEl = document.getElementById('output');
+      const sourceEl = document.getElementById('sourceText');
+      const questionEl = document.getElementById('question');
+      const runBtn = document.getElementById('runBtn');
+
+      const engine = new FlyRAGSearchEngine({
+        quiet: false,
+        onProgress: ({ percent }) => {
+          progressEl.textContent = `${Math.max(0, Math.min(100, Math.round(percent)))}%`;
+        },
+      });
+
+      await engine.initialize();
+
+      runBtn.addEventListener('click', async () => {
+        outputEl.textContent = '';
+        runBtn.disabled = true;
+
+        try {
+          await engine.loadDocuments(sourceEl.value);
+          const result = await engine.ask(questionEl.value, {
+            topK: 4,
+            onToken(token) {
+              outputEl.textContent += token;
+            },
+          });
+
+          if (!result.answer) {
+            outputEl.textContent = '(No answer generated.)';
+          }
+        } catch (error) {
+          outputEl.textContent = `Error: ${error instanceof Error ? error.message : String(error)}`;
+        } finally {
+          runBtn.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>
