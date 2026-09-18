@@ -126,6 +126,7 @@ function overlapBits(a: StaticArray<u32>, b: StaticArray<u32>): i32 {
   let words = (activeHashBits + 31) >> 5;
   let overlap: i32 = 0;
 
+  // WTA similarity as Hamming intersection: number of active hash bits shared by both hashes.
   for (let i: i32 = 0; i < words; i++) {
     let bits = unchecked(a[i] & b[i]);
     overlap += popcnt<u32>(bits);

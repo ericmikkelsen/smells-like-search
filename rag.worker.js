@@ -199,7 +199,7 @@ async function ask(payload, requestId) {
     throw new Error('No document chunks loaded. Call LOAD_DOCUMENTS first.');
   }
 
-  const topK = Math.max(1, Number(payload?.topK ?? 4));
+  const topK = Math.max(1, toFiniteInt(payload?.topK, 4));
   const coarseLimit = Math.min(state.chunks.length, Math.max(topK * 4, 8));
 
   const coarse = state.chunks
