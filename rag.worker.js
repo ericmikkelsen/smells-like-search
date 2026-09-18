@@ -4,6 +4,8 @@ import * as webllm from 'https://esm.run/@mlc-ai/web-llm';
 const CHANNEL = 'FLYRAG_CORE';
 const encoder = new TextEncoder();
 const MIN_COARSE_CANDIDATES = 8;
+const MAX_ASK_ATTEMPTS = 3;
+const TOPK_DEFAULT_SCHEDULE = [4, 8, 12];
 const EMBEDDING_MODEL_ID = 'Xenova/all-MiniLM-L6-v2';
 const GENERATION_MODEL_ID = 'Llama-3.2-3B-Instruct-q4f16_1-MLC';
 const RAG_SYSTEM_PROMPT =
@@ -158,6 +160,165 @@ function rankByDenseSimilarity(queryEmbedding, candidates, topK) {
     .slice(0, topK);
 }
 
+function tokenize(text) {
+  return String(text ?? '')
+    .toLowerCase()
+    .match(/[a-z0-9]{3,}/g) ?? [];
+}
+
+const STOP_WORDS = new Set([
+  'the', 'and', 'for', 'that', 'with', 'this', 'from', 'are', 'was', 'were', 'have', 'has', 'had', 'not', 'but', 'you',
+  'your', 'can', 'could', 'would', 'should', 'about', 'there', 'their', 'them', 'they', 'his', 'her', 'she', 'him', 'our',
+  'out', 'what', 'when', 'where', 'which', 'who', 'how', 'why', 'all', 'any', 'only', 'into', 'then', 'than', 'also', 'more',
+  'very', 'some', 'just', 'like', 'one', 'two', 'three', 'text', 'context', 'provided',
+]);
+
+function toKeywordSet(text) {
+  const tokens = tokenize(text).filter((token) => !STOP_WORDS.has(token));
+  return new Set(tokens);
+}
+
+function ratioCovered(sourceTokens, evidenceSet) {
+  if (!sourceTokens.length) return 0;
+  let hits = 0;
+  for (const token of sourceTokens) {
+    if (evidenceSet.has(token)) hits += 1;
+  }
+  return hits / sourceTokens.length;
+}
+
+function hasInsufficientCue(answer) {
+  return /(insufficient|not enough|cannot answer|can't answer|cannot determine|can't determine|do not have enough|don't have enough)/i.test(answer);
+}
+
+function extractCapitalizedWords(text) {
+  const matches = String(text ?? '').match(/\b[A-Z][a-z]{2,}\b/g) ?? [];
+  return matches.map((item) => item.toLowerCase());
+}
+
+function buildTopKSchedule(baseTopK) {
+  const first = Math.max(1, toFiniteInt(baseTopK, TOPK_DEFAULT_SCHEDULE[0]));
+  return [
+    first,
+    Math.max(TOPK_DEFAULT_SCHEDULE[1], first * 2),
+    Math.max(TOPK_DEFAULT_SCHEDULE[2], first * 3),
+  ].slice(0, MAX_ASK_ATTEMPTS);
+}
+
+function rewriteQuestionForRecall(question) {
+  const tokens = Array.from(toKeywordSet(question)).slice(0, 8);
+  if (!tokens.length) return question;
+  return `${question}\nRelated terms: ${tokens.join(', ')}`;
+}
+
+async function retrieveContexts(query, topK, attemptIndex) {
+  const coarseMultiplier = Math.min(8, 4 + attemptIndex * 2);
+  const coarseFloor = MIN_COARSE_CANDIDATES + attemptIndex * 4;
+  const coarseLimit = Math.min(state.chunks.length, Math.max(topK * coarseMultiplier, coarseFloor));
+
+  const coarse = flyScoreAllChunks(query, state.chunks)
+    .sort((a, b) => b.flyScore - a.flyScore)
+    .slice(0, coarseLimit);
+
+  const queryEmbedding = await embedText(query);
+  const reranked = rankByDenseSimilarity(queryEmbedding, coarse, topK);
+  return { reranked, coarseLimit };
+}
+
+function buildContextString(reranked) {
+  return reranked
+    .map((item, idx) => `Context ${idx + 1} (chunk ${item.id}):\n${item.text}`)
+    .join('\n\n');
+}
+
+function evaluateAnswerQuality({ answer, question, contexts, attemptIndex }) {
+  const answerKeywords = Array.from(toKeywordSet(answer));
+  const questionKeywords = Array.from(toKeywordSet(question));
+  const contextKeywordSet = toKeywordSet(contexts.map((item) => item.text).join('\n'));
+  const questionKeywordSet = new Set(questionKeywords);
+
+  const groundedness = ratioCovered(answerKeywords, contextKeywordSet);
+  const relevance = ratioCovered(answerKeywords, questionKeywordSet);
+
+  const namedEntities = extractCapitalizedWords(answer);
+  const contextCapitalized = new Set(extractCapitalizedWords(contexts.map((item) => item.text).join('\n')));
+  const questionCapitalized = new Set(extractCapitalizedWords(question));
+  const unsupportedEntities = namedEntities.filter(
+    (token) => !contextCapitalized.has(token) && !questionCapitalized.has(token),
+  );
+  const contradictionRisk = namedEntities.length ? unsupportedEntities.length / namedEntities.length : 0;
+  const contradictionScore = 1 - contradictionRisk;
+
+  const insufficientCue = hasInsufficientCue(answer);
+  const uncertainOrLowGrounding = groundedness < 0.72;
+  const uncertaintyHandled = !uncertainOrLowGrounding || insufficientCue;
+
+  const lowEvidenceSafeRefusal = insufficientCue && contradictionScore >= 0.7 && answer.length <= 360;
+  const passesGrounding = groundedness >= 0.72 && contradictionScore >= 0.7 && relevance >= 0.15;
+
+  const pass = passesGrounding || lowEvidenceSafeRefusal;
+  let failReason = '';
+  if (!pass) {
+    if (!uncertaintyHandled) failReason = 'missing_uncertainty';
+    else if (contradictionScore < 0.7) failReason = 'possible_hallucination';
+    else if (groundedness < 0.72) failReason = 'low_groundedness';
+    else if (relevance < 0.15) failReason = 'low_relevance';
+    else failReason = 'quality_gate_failed';
+  }
+
+  return {
+    pass,
+    failReason,
+    stopCandidate: pass ? 'quality_passed' : '',
+    scores: {
+      groundedness: Number(groundedness.toFixed(3)),
+      relevance: Number(relevance.toFixed(3)),
+      contradiction: Number(contradictionScore.toFixed(3)),
+      uncertaintyHandled,
+    },
+    details: {
+      attempt: attemptIndex + 1,
+      insufficientCue,
+      unsupportedEntities,
+    },
+  };
+}
+
+async function generateAnswer(question, context) {
+  if (state.llmBackend === LLM_BACKEND.NANO) {
+    let session;
+    try {
+      session = await self.ai.languageModel.create({
+        initialPrompts: [{ role: 'system', content: RAG_SYSTEM_PROMPT }],
+      });
+    } catch (nanoError) {
+      throw new Error(`Gemini Nano session creation failed: ${nanoError instanceof Error ? nanoError.message : String(nanoError)}`);
+    }
+    try {
+      const prompt = `Question:\n${question}\n\nRetrieved context:\n${context}`;
+      return await session.prompt(prompt);
+    } catch (promptError) {
+      throw new Error(`Gemini Nano generation failed: ${promptError instanceof Error ? promptError.message : String(promptError)}`);
+    } finally {
+      session.destroy();
+    }
+  }
+
+  if (!state.llm) {
+    throw new Error('Language model engine is not available.');
+  }
+
+  const completion = await state.llm.chat.completions.create({
+    messages: [
+      { role: 'system', content: RAG_SYSTEM_PROMPT },
+      { role: 'user', content: `Question:\n${question}\n\nRetrieved context:\n${context}` },
+    ],
+    temperature: 0.2,
+    max_tokens: 512,
+  });
+  return completion?.choices?.[0]?.message?.content ?? '';
+}
+
 async function checkNanoAvailable() {
   try {
     if (typeof self.ai?.languageModel?.capabilities !== 'function') return false;
@@ -280,91 +441,87 @@ async function ask(payload, requestId) {
     throw new Error('No document chunks loaded. Call LOAD_DOCUMENTS first.');
   }
 
-  const topK = Math.max(1, toFiniteInt(payload?.topK, 4));
-  const coarseLimit = Math.min(state.chunks.length, Math.max(topK * 4, MIN_COARSE_CANDIDATES));
+  const topKSchedule = buildTopKSchedule(payload?.topK);
+  const attemptDebug = [];
+  const seenContextIds = new Set();
+  let finalAnswer = '';
+  let finalContexts = [];
+  let finalQuality = null;
+  let stopReason = 'max_attempts_reached';
 
-  const coarse = flyScoreAllChunks(question, state.chunks)
-    .sort((a, b) => b.flyScore - a.flyScore)
-    .slice(0, coarseLimit);
+  for (let attemptIndex = 0; attemptIndex < MAX_ASK_ATTEMPTS; attemptIndex++) {
+    const topK = topKSchedule[Math.min(attemptIndex, topKSchedule.length - 1)];
+    const retrievalQuestion = attemptIndex === MAX_ASK_ATTEMPTS - 1 ? rewriteQuestionForRecall(question) : question;
+    const { reranked, coarseLimit } = await retrieveContexts(retrievalQuestion, topK, attemptIndex);
+    const context = buildContextString(reranked);
+    const contextIds = reranked.map((item) => item.id);
 
-  const queryEmbedding = await embedText(question);
-  const reranked = rankByDenseSimilarity(queryEmbedding, coarse, topK);
-
-  const context = reranked
-    .map((item, idx) => `Context ${idx + 1}:\n${item.text}`)
-    .join('\n\n');
-
-  let answer = '';
-
-  if (state.llmBackend === LLM_BACKEND.NANO) {
-    // Chrome Prompt API — create a fresh per-question session to avoid context bleed.
-    // System prompt must be the first entry in initialPrompts per the Prompt API spec.
-    let session;
-    try {
-      session = await self.ai.languageModel.create({
-        initialPrompts: [{ role: 'system', content: RAG_SYSTEM_PROMPT }],
-      });
-    } catch (nanoError) {
-      // Nano became unavailable (e.g. model unloaded); surface a clear error.
-      throw new Error(`Gemini Nano session creation failed: ${nanoError instanceof Error ? nanoError.message : String(nanoError)}`);
+    const newlyAddedCount = contextIds.filter((id) => !seenContextIds.has(id)).length;
+    for (const id of contextIds) {
+      seenContextIds.add(id);
     }
-    try {
-      const prompt = `Question:\n${question}\n\nRetrieved context:\n${context}`;
-      // promptStreaming returns a ReadableStream that yields the cumulative response text.
-      // Diff against previousLength to extract each new incremental token.
-      const stream = session.promptStreaming(prompt);
-      const reader = stream.getReader();
-      let previousLength = 0;
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = typeof value === 'string' ? value : (value?.content ?? String(value ?? ''));
-          const token = chunk.slice(previousLength);
-          previousLength = chunk.length;
-          if (!token) continue;
-          answer += token;
-          post('STREAM', { requestId, token });
-        }
-      } finally {
-        reader.releaseLock();
-      }
-    } catch (streamError) {
-      throw new Error(`Gemini Nano generation failed: ${streamError instanceof Error ? streamError.message : String(streamError)}`);
-    } finally {
-      session.destroy();
-    }
-  } else {
-    if (!state.llm) {
-      throw new Error('Language model engine is not available.');
-    }
-    const messages = [
-      { role: 'system', content: RAG_SYSTEM_PROMPT },
-      {
-        role: 'user',
-        content: `Question:\n${question}\n\nRetrieved context:\n${context}`,
-      },
-    ];
 
-    const stream = await state.llm.chat.completions.create({
-      messages,
-      temperature: 0.2,
-      max_tokens: 512,
-      stream: true,
+    const answer = await generateAnswer(question, context);
+    const quality = evaluateAnswerQuality({
+      answer,
+      question,
+      contexts: reranked,
+      attemptIndex,
     });
 
-    for await (const part of stream) {
-      const token = part?.choices?.[0]?.delta?.content ?? '';
-      if (!token) continue;
+    attemptDebug.push({
+      attempt: attemptIndex + 1,
+      retrievalQuestion,
+      topK,
+      coarseLimit,
+      contextIds,
+      newlyAddedContextCount: newlyAddedCount,
+      quality,
+    });
 
-      answer += token;
-      post('STREAM', { requestId, token });
+    finalAnswer = answer;
+    finalContexts = reranked;
+    finalQuality = quality;
+
+    if (quality.pass) {
+      stopReason = 'quality_passed';
+      break;
+    }
+
+    const retrievalSaturated = attemptIndex > 0 && newlyAddedCount === 0;
+    const lastAttempt = attemptIndex === MAX_ASK_ATTEMPTS - 1;
+    if (retrievalSaturated) {
+      stopReason = 'retrieval_saturated';
+      break;
+    }
+    if (lastAttempt) {
+      stopReason = 'low_confidence_after_expansion';
+      break;
     }
   }
 
+  if (!finalQuality?.pass) {
+    finalAnswer = `I don’t have enough grounded context to answer that reliably. ${finalQuality?.failReason ? `Reason: ${finalQuality.failReason}.` : ''} Please provide more source text or a more specific excerpt.`;
+  }
+
+  if (finalAnswer) {
+    post('STREAM', { requestId, token: finalAnswer });
+  }
+
   return {
-    answer,
-    contexts: reranked.map((item) => ({ text: item.text, flyScore: item.flyScore, denseScore: item.denseScore })),
+    answer: finalAnswer,
+    contexts: finalContexts.map((item) => ({
+      id: item.id,
+      text: item.text,
+      flyScore: item.flyScore,
+      denseScore: item.denseScore,
+    })),
+    debug: {
+      attempts: attemptDebug,
+      stopReason,
+      passedQualityGate: Boolean(finalQuality?.pass),
+      finalScores: finalQuality?.scores ?? null,
+    },
   };
 }
 
