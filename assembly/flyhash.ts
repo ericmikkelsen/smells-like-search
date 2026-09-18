@@ -162,8 +162,37 @@ export function candidateBufferPtr(): usize {
   return candidatePtr;
 }
 
+export function candidateBitsPtr(): usize {
+  return changetype<usize>(candidateBits);
+}
+
 export function bufferCapacity(): i32 {
   return MAX_INPUT_BYTES;
+}
+
+export function hashBitWords(): i32 {
+  return (activeHashBits + 31) >> 5;
+}
+
+// Hash whatever is currently in queryBuffer into queryBits.
+export function hashQueryBuffer(queryLength: i32): void {
+  let qLen = minI32(queryLength, MAX_INPUT_BYTES);
+  if (qLen < 0) qLen = 0;
+  buildFeatures(queryPtr, qLen, queryFeatures);
+  hashFeatures(queryFeatures, queryBits);
+}
+
+// Hash whatever is currently in candidateBuffer into candidateBits.
+export function hashCandidateBuffer(candidateLength: i32): void {
+  let cLen = minI32(candidateLength, MAX_INPUT_BYTES);
+  if (cLen < 0) cLen = 0;
+  buildFeatures(candidatePtr, cLen, candidateFeatures);
+  hashFeatures(candidateFeatures, candidateBits);
+}
+
+// Overlap queryBits against whatever is currently in candidateBits.
+export function overlapPrecomputed(): i32 {
+  return overlapBits(queryBits, candidateBits);
 }
 
 export function scoreFromBuffers(queryLength: i32, candidateLength: i32): i32 {
