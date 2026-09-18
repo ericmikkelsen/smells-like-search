@@ -15,6 +15,7 @@ const state = {
   embedder: null,
   llm: null,
   chunks: [],
+  initializing: null,
 };
 
 function post(type, payload = {}) {
@@ -82,7 +83,13 @@ function cosine(a, b) {
   }
 
   if (!normA || !normB) return 0;
-  return dot / Math.sqrt(normA * normB);
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+function toFiniteInt(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.trunc(parsed);
 }
 
 async function embedText(text) {
@@ -124,10 +131,10 @@ async function initialize(payload) {
   if (payload?.flyHashConfig) {
     const cfg = payload.flyHashConfig;
     wasmExports.configure(
-      Number(cfg.hashBits ?? 512),
-      Number(cfg.winners ?? 48),
-      Number(cfg.projections ?? 6),
-      Number(cfg.seed ?? 0xC0FFEE),
+      toFiniteInt(cfg.hashBits, 512),
+      toFiniteInt(cfg.winners, 48),
+      toFiniteInt(cfg.projections, 6),
+      toFiniteInt(cfg.seed, 0xC0FFEE) >>> 0,
     );
   }
   post('PROGRESS', { percent: 12 });
@@ -239,7 +246,14 @@ self.addEventListener('message', async (event) => {
   try {
     if (type === 'INIT') {
       if (!state.initialized) {
-        await initialize(payload);
+        if (!state.initializing) {
+          state.initializing = initialize(payload);
+        }
+        try {
+          await state.initializing;
+        } finally {
+          state.initializing = null;
+        }
       }
       post('READY', { requestId });
       return;
