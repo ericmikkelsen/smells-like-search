@@ -10,6 +10,7 @@ export class FlyRAGSearchEngine {
     this.pending = new Map();
     this.streamHandlers = new Map();
     this.isInitializing = false;
+    this.initFailed = false;
 
     this.worker.addEventListener('message', (event) => this.#handleMessage(event.data));
     this.worker.addEventListener('error', (error) => {
@@ -21,7 +22,7 @@ export class FlyRAGSearchEngine {
   }
 
   async initialize({ retry = false } = {}) {
-    if (retry && !this.isInitializing) {
+    if (retry && this.initFailed && !this.isInitializing) {
       this.ready = this.#startInit();
     }
     await this.ready;
@@ -66,9 +67,18 @@ export class FlyRAGSearchEngine {
 
   #startInit() {
     this.isInitializing = true;
-    return this.#send('INIT', this.initPayload).finally(() => {
-      this.isInitializing = false;
-    });
+    return this.#send('INIT', this.initPayload)
+      .then((result) => {
+        this.initFailed = false;
+        return result;
+      })
+      .catch((error) => {
+        this.initFailed = true;
+        throw error;
+      })
+      .finally(() => {
+        this.isInitializing = false;
+      });
   }
 
   #nextRequestId() {

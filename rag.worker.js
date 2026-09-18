@@ -296,6 +296,7 @@ self.addEventListener('message', async (event) => {
 
     throw new Error(`Unknown command type: ${type}`);
   } catch (error) {
+    state.initializing = null;
     post('ERROR', {
       requestId,
       message: error instanceof Error ? error.message : String(error),

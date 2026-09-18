@@ -29,7 +29,7 @@ jobs:
       - name: Build flyhash wasm
         run: |
           mkdir -p dist/assembly
-          npx -y -p assemblyscript asc assembly/flyhash.ts -O3 --runtime stub -o dist/assembly/flyhash.wasm
+          npx -y -p assemblyscript@0.27.37 asc assembly/flyhash.ts -O3 --runtime stub -o dist/assembly/flyhash.wasm
 
       - name: Copy static POC assets
         run: |
