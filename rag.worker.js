@@ -219,6 +219,28 @@ function rewriteQuestionForRecall(question) {
   return `${question}\nRelated terms: ${tokens.join(', ')}`;
 }
 
+function humanizeFailReason(reason) {
+  switch (reason) {
+    case 'missing_uncertainty':
+      return 'answer was not sufficiently grounded and did not clearly acknowledge missing evidence';
+    case 'possible_hallucination':
+      return 'answer appears to include unsupported details';
+    case 'low_groundedness':
+      return 'retrieved context did not provide enough direct support';
+    case 'low_relevance':
+      return 'answer did not align closely enough with the question';
+    default:
+      return 'answer quality did not meet grounding thresholds';
+  }
+}
+
+async function emitTokenStream(requestId, tokens) {
+  for (const token of tokens) {
+    post('STREAM', { requestId, token });
+    await Promise.resolve();
+  }
+}
+
 async function retrieveContexts(query, topK, attemptIndex) {
   const coarseMultiplier = Math.min(8, 4 + attemptIndex * 2);
   const coarseFloor = MIN_COARSE_CANDIDATES + attemptIndex * 4;
@@ -241,9 +263,8 @@ function buildContextString(reranked) {
 
 function evaluateAnswerQuality({ answer, question, contexts, attemptIndex }) {
   const answerKeywords = Array.from(toKeywordSet(answer));
-  const questionKeywords = Array.from(toKeywordSet(question));
+  const questionKeywordSet = toKeywordSet(question);
   const contextKeywordSet = toKeywordSet(contexts.map((item) => item.text).join('\n'));
-  const questionKeywordSet = new Set(questionKeywords);
 
   const groundedness = ratioCovered(answerKeywords, contextKeywordSet);
   const relevance = ratioCovered(answerKeywords, questionKeywordSet);
@@ -293,6 +314,9 @@ function evaluateAnswerQuality({ answer, question, contexts, attemptIndex }) {
 }
 
 async function generateAnswer(question, context) {
+  const tokens = [];
+  let answer = '';
+
   if (state.llmBackend === LLM_BACKEND.NANO) {
     let session;
     try {
@@ -304,27 +328,53 @@ async function generateAnswer(question, context) {
     }
     try {
       const prompt = `Question:\n${question}\n\nRetrieved context:\n${context}`;
-      return await session.prompt(prompt);
-    } catch (promptError) {
-      throw new Error(`Gemini Nano generation failed: ${promptError instanceof Error ? promptError.message : String(promptError)}`);
+      const stream = session.promptStreaming(prompt);
+      const reader = stream.getReader();
+      let previousLength = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = typeof value === 'string' ? value : (value?.content ?? String(value ?? ''));
+          const token = chunk.slice(previousLength);
+          previousLength = chunk.length;
+          if (!token) continue;
+          tokens.push(token);
+          answer += token;
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    } catch (streamError) {
+      throw new Error(`Gemini Nano generation failed: ${streamError instanceof Error ? streamError.message : String(streamError)}`);
     } finally {
       session.destroy();
     }
+    return { answer, tokens };
   }
 
   if (!state.llm) {
     throw new Error('Language model engine is not available.');
   }
 
-  const completion = await state.llm.chat.completions.create({
+  const stream = await state.llm.chat.completions.create({
     messages: [
       { role: 'system', content: RAG_SYSTEM_PROMPT },
       { role: 'user', content: `Question:\n${question}\n\nRetrieved context:\n${context}` },
     ],
     temperature: 0.2,
     max_tokens: 512,
+    stream: true,
   });
-  return completion?.choices?.[0]?.message?.content ?? '';
+
+  for await (const part of stream) {
+    const token = part?.choices?.[0]?.delta?.content ?? '';
+    if (!token) continue;
+    tokens.push(token);
+    answer += token;
+  }
+
+  return { answer, tokens };
 }
 
 async function checkNanoAvailable() {
@@ -453,13 +503,14 @@ async function ask(payload, requestId) {
   const attemptDebug = [];
   const seenContextIds = new Set();
   let finalAnswer = '';
+  let finalTokens = [];
   let finalContexts = [];
   let finalQuality = null;
   let stopReason = 'max_attempts_reached';
 
   for (let attemptIndex = 0; attemptIndex < MAX_ASK_ATTEMPTS; attemptIndex++) {
     const topK = topKSchedule[Math.min(attemptIndex, topKSchedule.length - 1)];
-    const retrievalQuestion = attemptIndex === MAX_ASK_ATTEMPTS - 1 ? rewriteQuestionForRecall(question) : question;
+    const retrievalQuestion = attemptIndex > 0 ? rewriteQuestionForRecall(question) : question;
     post('STATUS', { text: `Answer attempt ${attemptIndex + 1}/${MAX_ASK_ATTEMPTS} (topK=${topK})…` });
     const { reranked, coarseLimit } = await retrieveContexts(retrievalQuestion, topK, attemptIndex);
     const context = buildContextString(reranked);
@@ -470,7 +521,7 @@ async function ask(payload, requestId) {
       seenContextIds.add(id);
     }
 
-    const answer = await generateAnswer(question, context);
+    const { answer, tokens } = await generateAnswer(question, context);
     const quality = evaluateAnswerQuality({
       answer,
       question,
@@ -489,6 +540,7 @@ async function ask(payload, requestId) {
     });
 
     finalAnswer = answer;
+    finalTokens = tokens;
     finalContexts = reranked;
     finalQuality = quality;
 
@@ -497,7 +549,7 @@ async function ask(payload, requestId) {
       break;
     }
 
-    const retrievalSaturated = attemptIndex > 0 && newlyAddedCount === 0;
+    const retrievalSaturated = attemptIndex > 0 && attemptIndex < MAX_ASK_ATTEMPTS - 1 && newlyAddedCount === 0;
     const lastAttempt = attemptIndex === MAX_ASK_ATTEMPTS - 1;
     if (retrievalSaturated) {
       stopReason = 'retrieval_saturated';
@@ -510,12 +562,16 @@ async function ask(payload, requestId) {
   }
 
   if (!finalQuality?.pass) {
-    finalAnswer = `I don’t have enough grounded context to answer that reliably. ${finalQuality?.failReason ? `Reason: ${finalQuality.failReason}.` : ''} Please provide more source text or a more specific excerpt.`;
+    const reasonText = humanizeFailReason(finalQuality?.failReason ?? '');
+    finalAnswer = `I don’t have enough grounded context to answer that reliably. ${reasonText}. Please provide more source text or a more specific excerpt.`;
+    finalTokens = [finalAnswer];
   }
 
-  if (finalAnswer) {
-    post('STREAM', { requestId, token: finalAnswer });
+  if (!finalTokens.length) {
+    finalTokens = [finalAnswer];
   }
+
+  await emitTokenStream(requestId, finalTokens);
 
   return {
     answer: finalAnswer,
