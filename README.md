@@ -18,3 +18,9 @@ This repository is configured to deploy the POC to GitHub Pages using `.github/w
   - `FlyRAGSearchEngine.js`
   - `rag.worker.js`
   - generated `assembly/flyhash.wasm`
+
+### PR preview flow
+
+- On every PR open/update/reopen event, `.github/workflows/pr-preview.yml` builds and deploys a preview.
+- The workflow posts (and updates) a PR comment with the latest preview URL.
+- Previews run only for same-repository branches (not forks), since Pages write permissions are required.

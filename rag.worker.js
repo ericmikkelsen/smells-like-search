@@ -173,6 +173,12 @@ const STOP_WORDS = new Set([
   'very', 'some', 'just', 'like', 'one', 'two', 'three', 'text', 'context', 'provided',
 ]);
 
+const CAPITALIZED_IGNORE = new Set([
+  ...STOP_WORDS,
+  'based', 'according', 'assistant', 'user', 'question', 'contexts', 'context', 'retrieved',
+  'insufficient', 'please', 'reason', 'related', 'terms',
+]);
+
 function toKeywordSet(text) {
   const tokens = tokenize(text).filter((token) => !STOP_WORDS.has(token));
   return new Set(tokens);
@@ -193,7 +199,9 @@ function hasInsufficientCue(answer) {
 
 function extractCapitalizedWords(text) {
   const matches = String(text ?? '').match(/\b[A-Z][a-z]{2,}\b/g) ?? [];
-  return matches.map((item) => item.toLowerCase());
+  return matches
+    .map((item) => item.toLowerCase())
+    .filter((item) => !CAPITALIZED_IGNORE.has(item));
 }
 
 function buildTopKSchedule(baseTopK) {
@@ -452,6 +460,7 @@ async function ask(payload, requestId) {
   for (let attemptIndex = 0; attemptIndex < MAX_ASK_ATTEMPTS; attemptIndex++) {
     const topK = topKSchedule[Math.min(attemptIndex, topKSchedule.length - 1)];
     const retrievalQuestion = attemptIndex === MAX_ASK_ATTEMPTS - 1 ? rewriteQuestionForRecall(question) : question;
+    post('STATUS', { text: `Answer attempt ${attemptIndex + 1}/${MAX_ASK_ATTEMPTS} (topK=${topK})…` });
     const { reranked, coarseLimit } = await retrieveContexts(retrievalQuestion, topK, attemptIndex);
     const context = buildContextString(reranked);
     const contextIds = reranked.map((item) => item.id);
