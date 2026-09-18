@@ -3,6 +3,7 @@ import * as webllm from 'https://esm.run/@mlc-ai/web-llm';
 
 const CHANNEL = 'FLYRAG_CORE';
 const encoder = new TextEncoder();
+const MIN_COARSE_CANDIDATES = 8;
 
 const state = {
   quiet: false,
@@ -162,6 +163,8 @@ async function initialize(payload) {
     post('PROGRESS', { percent: 100 });
   } catch (error) {
     state.initialized = false;
+    state.initializing = null;
+    state.initializingPayloadKey = null;
     state.wasm = null;
     state.memory = null;
     state.queryPtr = 0;
@@ -201,7 +204,7 @@ async function ask(payload, requestId) {
   }
 
   const topK = Math.max(1, toFiniteInt(payload?.topK, 4));
-  const coarseLimit = Math.min(state.chunks.length, Math.max(topK * 4, 8));
+  const coarseLimit = Math.min(state.chunks.length, Math.max(topK * 4, MIN_COARSE_CANDIDATES));
 
   const coarse = state.chunks
     .map((chunk) => ({ ...chunk, flyScore: flyScore(question, chunk.text) }))
