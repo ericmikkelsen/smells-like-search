@@ -94,7 +94,7 @@ function hashFeatures(features: StaticArray<f32>, outBits: StaticArray<u32>): vo
   let words = (activeHashBits + 31) >> 5;
   clearBits(outBits, words);
 
-  let winners = minI32(activeWinners, activeHashBits);
+  let winners = minI32(minI32(activeWinners, activeHashBits), MAX_WINNERS);
   for (let i: i32 = 0; i < winners; i++) {
     unchecked(topScores[i] = -f32.MAX_VALUE);
     unchecked(topIndices[i] = -1);
