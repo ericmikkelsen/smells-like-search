@@ -31,7 +31,7 @@ export class FlyRAGSearchEngine {
   async ask(question, { topK = 4, onToken } = {}) {
     await this.ready;
 
-    const requestId = this.requestId++;
+    const requestId = this.#nextRequestId();
     if (typeof onToken === 'function') {
       this.streamHandlers.set(requestId, onToken);
     }
@@ -56,7 +56,13 @@ export class FlyRAGSearchEngine {
   }
 
   #send(type, payload) {
-    return this.#sendWithId(this.requestId++, type, payload);
+    return this.#sendWithId(this.#nextRequestId(), type, payload);
+  }
+
+  #nextRequestId() {
+    const id = this.requestId;
+    this.requestId += 1;
+    return id;
   }
 
   #sendWithId(requestId, type, payload) {

@@ -15,6 +15,8 @@ let activeSeed: u32 = 0xC0FFEE;
 
 const queryBuffer = new StaticArray<u8>(MAX_INPUT_BYTES);
 const candidateBuffer = new StaticArray<u8>(MAX_INPUT_BYTES);
+const queryPtr = changetype<usize>(queryBuffer);
+const candidatePtr = changetype<usize>(candidateBuffer);
 
 const queryFeatures = new StaticArray<f32>(FEATURE_DIM);
 const candidateFeatures = new StaticArray<f32>(FEATURE_DIM);
@@ -93,7 +95,7 @@ function hashFeatures(features: StaticArray<f32>, outBits: StaticArray<u32>): vo
 
   let winners = minI32(activeWinners, activeHashBits);
   for (let i: i32 = 0; i < winners; i++) {
-    unchecked(topScores[i] = -3.40282347e38);
+    unchecked(topScores[i] = -f32.MAX_VALUE);
     unchecked(topIndices[i] = -1);
   }
 
@@ -149,11 +151,11 @@ export function configure(hashBits: i32 = 512, winners: i32 = 48, projections: i
 }
 
 export function queryBufferPtr(): usize {
-  return changetype<usize>(queryBuffer);
+  return queryPtr;
 }
 
 export function candidateBufferPtr(): usize {
-  return changetype<usize>(candidateBuffer);
+  return candidatePtr;
 }
 
 export function bufferCapacity(): i32 {
@@ -166,9 +168,10 @@ export function scoreFromBuffers(queryLength: i32, candidateLength: i32): i32 {
 
   let cLen = minI32(candidateLength, MAX_INPUT_BYTES);
   if (cLen < 0) cLen = 0;
+  if (qLen == 0 || cLen == 0) return 0;
 
-  buildFeatures(queryBufferPtr(), qLen, queryFeatures);
-  buildFeatures(candidateBufferPtr(), cLen, candidateFeatures);
+  buildFeatures(queryPtr, qLen, queryFeatures);
+  buildFeatures(candidatePtr, cLen, candidateFeatures);
 
   hashFeatures(queryFeatures, queryBits);
   hashFeatures(candidateFeatures, candidateBits);

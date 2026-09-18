@@ -82,7 +82,7 @@ function cosine(a, b) {
   }
 
   if (!normA || !normB) return 0;
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  return dot / Math.sqrt(normA * normB);
 }
 
 async function embedText(text) {
