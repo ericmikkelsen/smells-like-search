@@ -16,6 +16,7 @@ const state = {
   llm: null,
   chunks: [],
   initializing: null,
+  initializingPayloadKey: null,
 };
 
 function post(type, payload = {}) {
@@ -258,14 +259,19 @@ self.addEventListener('message', async (event) => {
 
   try {
     if (type === 'INIT') {
+      const payloadKey = JSON.stringify(payload ?? {});
       if (!state.initialized) {
         if (!state.initializing) {
+          state.initializingPayloadKey = payloadKey;
           state.initializing = initialize(payload);
+        } else if (state.initializingPayloadKey !== payloadKey) {
+          throw new Error('INIT already in progress with different configuration payload.');
         }
         try {
           await state.initializing;
         } finally {
           state.initializing = null;
+          state.initializingPayloadKey = null;
         }
       }
       post('READY', { requestId });
@@ -297,6 +303,7 @@ self.addEventListener('message', async (event) => {
     throw new Error(`Unknown command type: ${type}`);
   } catch (error) {
     state.initializing = null;
+    state.initializingPayloadKey = null;
     post('ERROR', {
       requestId,
       message: error instanceof Error ? error.message : String(error),

@@ -62,6 +62,7 @@ function buildFeatures(ptr: usize, byteLength: i32, outFeatures: StaticArray<f32
   clearFeatures(outFeatures);
 
   let cappedLength = minI32(byteLength, MAX_INPUT_BYTES);
+  // Fast length normalization for coarse retrieval; exact dense normalization happens in reranking.
   let invNorm: f32 = cappedLength > 0 ? 1.0 / Mathf.sqrt(<f32>cappedLength) : 1.0;
 
   for (let i: i32 = 0; i < cappedLength; i++) {
