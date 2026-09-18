@@ -1,7 +1,7 @@
 const CHANNEL = 'FLYRAG_CORE';
 
 export class FlyRAGSearchEngine {
-  constructor({ quiet = false, workerUrl = './rag.worker.js', onProgress } = {}) {
+  constructor({ quiet = false, workerUrl = './rag.worker.js', onProgress, wasmUrl, flyHashConfig } = {}) {
     this.quiet = Boolean(quiet);
     this.onProgress = typeof onProgress === 'function' ? onProgress : null;
     this.worker = new Worker(workerUrl, { type: 'module' });
@@ -15,7 +15,7 @@ export class FlyRAGSearchEngine {
       if (!this.quiet) console.error('[FlyRAGSearchEngine] Worker error:', error);
     });
 
-    this.ready = this.#send('INIT', { quiet: this.quiet });
+    this.ready = this.#send('INIT', { quiet: this.quiet, wasmUrl, flyHashConfig });
   }
 
   async initialize() {

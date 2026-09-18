@@ -42,7 +42,12 @@
         },
       });
 
-      await engine.initialize();
+      try {
+        await engine.initialize();
+      } catch (error) {
+        outputEl.textContent = `Initialization error: ${error instanceof Error ? error.message : String(error)}`;
+        runBtn.disabled = true;
+      }
 
       runBtn.addEventListener('click', async () => {
         outputEl.textContent = '';

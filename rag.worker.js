@@ -35,7 +35,15 @@ function toPercent(value, min, max) {
 async function initWasm(wasmUrl = './assembly/flyhash.wasm') {
   const response = await fetch(wasmUrl);
   const bytes = await response.arrayBuffer();
-  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const { instance } = await WebAssembly.instantiate(bytes, {
+    env: {
+      abort(message, fileName, lineNumber, columnNumber) {
+        throw new Error(
+          `Wasm abort at ${lineNumber}:${columnNumber} (messagePtr=${message}, filePtr=${fileName})`,
+        );
+      },
+    },
+  });
   const exports = instance.exports;
 
   state.wasm = exports;
@@ -43,7 +51,7 @@ async function initWasm(wasmUrl = './assembly/flyhash.wasm') {
   state.queryPtr = Number(exports.queryBufferPtr());
   state.candidatePtr = Number(exports.candidateBufferPtr());
   state.bufferCapacity = Number(exports.bufferCapacity());
-  exports.configure(512, 48, 6, 0xC0FFEE);
+  return exports;
 }
 
 function writeText(ptr, text) {
@@ -112,7 +120,16 @@ async function initialize(payload) {
   state.quiet = Boolean(payload?.quiet);
   post('PROGRESS', { percent: 1 });
 
-  await initWasm(payload?.wasmUrl);
+  const wasmExports = await initWasm(payload?.wasmUrl);
+  if (payload?.flyHashConfig) {
+    const cfg = payload.flyHashConfig;
+    wasmExports.configure(
+      Number(cfg.hashBits ?? 512),
+      Number(cfg.winners ?? 48),
+      Number(cfg.projections ?? 6),
+      Number(cfg.seed ?? 0xC0FFEE),
+    );
+  }
   post('PROGRESS', { percent: 12 });
 
   state.embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {

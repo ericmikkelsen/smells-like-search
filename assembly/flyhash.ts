@@ -22,6 +22,7 @@ const candidateFeatures = new StaticArray<f32>(FEATURE_DIM);
 const queryBits = new StaticArray<u32>(MAX_WORDS);
 const candidateBits = new StaticArray<u32>(MAX_WORDS);
 
+// Scratch buffers reused per call for speed. This module assumes single-threaded Wasm execution.
 const topScores = new StaticArray<f32>(MAX_WINNERS);
 const topIndices = new StaticArray<i32>(MAX_WINNERS);
 
