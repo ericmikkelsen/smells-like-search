@@ -32,8 +32,8 @@ function log(...args) {
   }
 }
 
-function toPercent(value, min, max) {
-  const clamped = Math.max(0, Math.min(1, value));
+function toPercent(ratio, min, max) {
+  const clamped = Math.max(0, Math.min(1, ratio));
   return Math.round(min + clamped * (max - min));
 }
 
