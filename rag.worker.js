@@ -5,7 +5,7 @@ const CHANNEL = 'FLYRAG_CORE';
 const encoder = new TextEncoder();
 const MIN_COARSE_CANDIDATES = 8;
 const EMBEDDING_MODEL_ID = 'Xenova/all-MiniLM-L6-v2';
-const GENERATION_MODEL_ID = 'Llama-3.2-1B-Instruct-q4f16_1-MLC';
+const GENERATION_MODEL_ID = 'Llama-3.2-3B-Instruct-q4f16_1-MLC';
 
 const state = {
   quiet: false,
