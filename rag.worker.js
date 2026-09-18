@@ -5,7 +5,15 @@ const CHANNEL = 'FLYRAG_CORE';
 const encoder = new TextEncoder();
 const MIN_COARSE_CANDIDATES = 8;
 const EMBEDDING_MODEL_ID = 'Xenova/all-MiniLM-L6-v2';
-const GENERATION_MODEL_ID = 'Llama-3.2-1B-Instruct-q4f16_1-MLC';
+const GENERATION_MODEL_ID = 'Llama-3.2-3B-Instruct-q4f16_1-MLC';
+const RAG_SYSTEM_PROMPT =
+  'You are a retrieval-augmented assistant. Answer the question only using provided context. If context is insufficient, say so clearly.';
+
+// Generation backend: 'nano' = Chrome Prompt API, 'webllm' = WebLLM/Llama
+const LLM_BACKEND = {
+  NANO: 'nano',
+  WEBLLM: 'webllm',
+};
 
 const state = {
   quiet: false,
@@ -19,6 +27,7 @@ const state = {
   hashBitWords: 0,
   embedder: null,
   llm: null,
+  llmBackend: null,
   chunks: [],
   initializing: null,
   initializingPayloadKey: null,
@@ -149,6 +158,16 @@ function rankByDenseSimilarity(queryEmbedding, candidates, topK) {
     .slice(0, topK);
 }
 
+async function checkNanoAvailable() {
+  try {
+    if (typeof self.ai?.languageModel?.capabilities !== 'function') return false;
+    const caps = await self.ai.languageModel.capabilities();
+    return caps?.available === 'readily';
+  } catch {
+    return false;
+  }
+}
+
 async function initialize(payload) {
   state.quiet = Boolean(payload?.quiet);
   try {
@@ -187,18 +206,28 @@ async function initialize(payload) {
     });
 
     post('PROGRESS', { percent: 74 });
-    post('STATUS', { text: 'Downloading language model…' });
 
-    state.llm = await webllm.CreateMLCEngine(GENERATION_MODEL_ID, {
-      initProgressCallback(progress) {
-        const ratio = typeof progress?.progress === 'number' ? progress.progress : 0;
-        post('PROGRESS', { percent: toPercent(ratio, 74, 100) });
-        if (progress?.text) post('STATUS', { text: progress.text });
-      },
-    });
+    // Prefer Chrome's built-in Gemini Nano (Prompt API) if available.
+    const nanoAvailable = await checkNanoAvailable();
+    if (nanoAvailable) {
+      // No session needed at init time; a fresh session is created per-question.
+      state.llmBackend = LLM_BACKEND.NANO;
+      post('PROGRESS', { percent: 100 });
+      post('STATUS', { text: 'Ready (Gemini Nano).' });
+    } else {
+      post('STATUS', { text: 'Downloading language model…' });
+      state.llm = await webllm.CreateMLCEngine(GENERATION_MODEL_ID, {
+        initProgressCallback(progress) {
+          const ratio = typeof progress?.progress === 'number' ? progress.progress : 0;
+          post('PROGRESS', { percent: toPercent(ratio, 74, 100) });
+          if (progress?.text) post('STATUS', { text: progress.text });
+        },
+      });
+      state.llmBackend = LLM_BACKEND.WEBLLM;
+      post('PROGRESS', { percent: 100 });
+    }
 
     state.initialized = true;
-    post('PROGRESS', { percent: 100 });
   } catch (error) {
     state.initialized = false;
     state.initializing = null;
@@ -212,6 +241,7 @@ async function initialize(payload) {
     state.hashBitWords = 0;
     state.embedder = null;
     state.llm = null;
+    state.llmBackend = null;
     state.chunks = [];
     throw error;
   }
@@ -264,32 +294,72 @@ async function ask(payload, requestId) {
     .map((item, idx) => `Context ${idx + 1}:\n${item.text}`)
     .join('\n\n');
 
-  const messages = [
-    {
-      role: 'system',
-      content:
-        'You are a retrieval-augmented assistant. Answer the question only using provided context. If context is insufficient, say so clearly.',
-    },
-    {
-      role: 'user',
-      content: `Question:\n${question}\n\nRetrieved context:\n${context}`,
-    },
-  ];
-
   let answer = '';
-  const stream = await state.llm.chat.completions.create({
-    messages,
-    temperature: 0.2,
-    max_tokens: 512,
-    stream: true,
-  });
 
-  for await (const part of stream) {
-    const token = part?.choices?.[0]?.delta?.content ?? '';
-    if (!token) continue;
+  if (state.llmBackend === LLM_BACKEND.NANO) {
+    // Chrome Prompt API — create a fresh per-question session to avoid context bleed.
+    // System prompt must be the first entry in initialPrompts per the Prompt API spec.
+    let session;
+    try {
+      session = await self.ai.languageModel.create({
+        initialPrompts: [{ role: 'system', content: RAG_SYSTEM_PROMPT }],
+      });
+    } catch (nanoError) {
+      // Nano became unavailable (e.g. model unloaded); surface a clear error.
+      throw new Error(`Gemini Nano session creation failed: ${nanoError instanceof Error ? nanoError.message : String(nanoError)}`);
+    }
+    try {
+      const prompt = `Question:\n${question}\n\nRetrieved context:\n${context}`;
+      // promptStreaming returns a ReadableStream that yields the cumulative response text.
+      // Diff against previousLength to extract each new incremental token.
+      const stream = session.promptStreaming(prompt);
+      const reader = stream.getReader();
+      let previousLength = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = typeof value === 'string' ? value : (value?.content ?? String(value ?? ''));
+          const token = chunk.slice(previousLength);
+          previousLength = chunk.length;
+          if (!token) continue;
+          answer += token;
+          post('STREAM', { requestId, token });
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    } catch (streamError) {
+      throw new Error(`Gemini Nano generation failed: ${streamError instanceof Error ? streamError.message : String(streamError)}`);
+    } finally {
+      session.destroy();
+    }
+  } else {
+    if (!state.llm) {
+      throw new Error('Language model engine is not available.');
+    }
+    const messages = [
+      { role: 'system', content: RAG_SYSTEM_PROMPT },
+      {
+        role: 'user',
+        content: `Question:\n${question}\n\nRetrieved context:\n${context}`,
+      },
+    ];
 
-    answer += token;
-    post('STREAM', { requestId, token });
+    const stream = await state.llm.chat.completions.create({
+      messages,
+      temperature: 0.2,
+      max_tokens: 512,
+      stream: true,
+    });
+
+    for await (const part of stream) {
+      const token = part?.choices?.[0]?.delta?.content ?? '';
+      if (!token) continue;
+
+      answer += token;
+      post('STREAM', { requestId, token });
+    }
   }
 
   return {
