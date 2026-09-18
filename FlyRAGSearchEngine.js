@@ -22,7 +22,7 @@ export class FlyRAGSearchEngine {
   }
 
   async initialize({ retry = this.initFailed } = {}) {
-    if (retry && this.initFailed && !this.isInitializing) {
+    if (retry && this.initFailed) {
       await this.#startInit();
       return;
     }

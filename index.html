@@ -88,7 +88,7 @@
         await engine.initialize();
         statusEl.textContent = 'Engine initialized. Upload or paste text, then submit.';
         ingestBtn.disabled = false;
-        chatBtn.disabled = false;
+        chatBtn.disabled = true;
       } catch (error) {
         statusEl.textContent = `Initialization error: ${error instanceof Error ? error.message : String(error)}`;
         ingestBtn.disabled = true;
@@ -115,8 +115,10 @@
           statusEl.textContent = `Loaded ${chunkCount} chunks from ${sourceCount} source${sourceCount === 1 ? '' : 's'}. You can now send chat messages.`;
           sourceTextEl.value = '';
           sourceFileEl.value = '';
+          chatBtn.disabled = false;
         } catch (error) {
           statusEl.textContent = `Load error: ${error instanceof Error ? error.message : String(error)}`;
+          if (!hasLoadedDocuments) chatBtn.disabled = true;
         } finally {
           ingestBtn.disabled = false;
         }
