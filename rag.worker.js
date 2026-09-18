@@ -14,7 +14,9 @@ const state = {
   memory: null,
   queryPtr: 0,
   candidatePtr: 0,
+  candidateBitsPtr: 0,
   bufferCapacity: 0,
+  hashBitWords: 0,
   embedder: null,
   llm: null,
   chunks: [],
@@ -55,7 +57,9 @@ async function initWasm(wasmUrl = './assembly/flyhash.wasm') {
   state.memory = exports.memory;
   state.queryPtr = Number(exports.queryBufferPtr());
   state.candidatePtr = Number(exports.candidateBufferPtr());
+  state.candidateBitsPtr = Number(exports.candidateBitsPtr());
   state.bufferCapacity = Number(exports.bufferCapacity());
+  state.hashBitWords = Number(exports.hashBitWords());
   return exports;
 }
 
@@ -68,10 +72,28 @@ function writeText(ptr, text) {
   return length;
 }
 
-function flyScore(queryText, candidateText) {
+// Pre-compute a fly hash for a piece of text. Returns a Uint32Array copy of the bit vector.
+function flyHash(text) {
+  const cLen = writeText(state.candidatePtr, text);
+  state.wasm.hashCandidateBuffer(cLen);
+  const words = state.hashBitWords;
+  const bits = new Uint32Array(state.memory.buffer, state.candidateBitsPtr, words);
+  return bits.slice(); // copy out of WASM memory
+}
+
+// Score the query (already hashed into queryBits) against a pre-computed bit vector.
+function flyScorePrecomputed(storedBits) {
+  const words = state.hashBitWords;
+  const dest = new Uint32Array(state.memory.buffer, state.candidateBitsPtr, words);
+  dest.set(storedBits);
+  return Number(state.wasm.overlapPrecomputed());
+}
+
+// Hash query text into queryBits once, then score it against every chunk's stored bits.
+function flyScoreAllChunks(queryText, chunks) {
   const qLen = writeText(state.queryPtr, queryText);
-  const cLen = writeText(state.candidatePtr, candidateText);
-  return Number(state.wasm.scoreFromBuffers(qLen, cLen));
+  state.wasm.hashQueryBuffer(qLen);
+  return chunks.map((chunk) => ({ ...chunk, flyScore: flyScorePrecomputed(chunk.flyBits) }));
 }
 
 function cosine(a, b) {
@@ -141,23 +163,37 @@ async function initialize(payload) {
         toFiniteInt(cfg.projections, 6),
         toFiniteInt(cfg.seed, 0xC0FFEE) >>> 0,
       );
+      // Re-read hashBitWords after configure() since activeHashBits may have changed.
+      state.hashBitWords = Number(wasmExports.hashBitWords());
     }
     post('PROGRESS', { percent: 12 });
 
+    post('STATUS', { text: 'Downloading embedding model…' });
     state.embedder = await pipeline('feature-extraction', EMBEDDING_MODEL_ID, {
+      dtype: 'q8',
       progress_callback(progress) {
-        if (progress?.total == null || progress?.loaded == null || progress.total <= 0) return;
-        const ratio = progress.loaded / progress.total;
-        post('PROGRESS', { percent: toPercent(ratio, 12, 72) });
+        if (progress?.loaded == null) return;
+        if (progress.total != null && progress.total > 0) {
+          const ratio = progress.loaded / progress.total;
+          post('PROGRESS', { percent: toPercent(ratio, 12, 72) });
+        } else if (progress.loaded > 0) {
+          // Content-Length header unavailable — pulse progress so the UI doesn't appear stuck.
+          const MB = progress.loaded / (1024 * 1024);
+          // Asymptotically approach 70% as bytes accumulate (saturates around 100 MB).
+          const ratio = 1 - Math.exp(-MB / 30);
+          post('PROGRESS', { percent: toPercent(ratio, 12, 72) });
+        }
       },
     });
 
     post('PROGRESS', { percent: 74 });
+    post('STATUS', { text: 'Downloading language model…' });
 
     state.llm = await webllm.CreateMLCEngine(GENERATION_MODEL_ID, {
       initProgressCallback(progress) {
         const ratio = typeof progress?.progress === 'number' ? progress.progress : 0;
         post('PROGRESS', { percent: toPercent(ratio, 74, 100) });
+        if (progress?.text) post('STATUS', { text: progress.text });
       },
     });
 
@@ -171,7 +207,9 @@ async function initialize(payload) {
     state.memory = null;
     state.queryPtr = 0;
     state.candidatePtr = 0;
+    state.candidateBitsPtr = 0;
     state.bufferCapacity = 0;
+    state.hashBitWords = 0;
     state.embedder = null;
     state.llm = null;
     state.chunks = [];
@@ -182,12 +220,19 @@ async function initialize(payload) {
 async function loadDocuments(payload) {
   const text = payload?.text ?? '';
   const chunks = chunkText(text);
+  const total = chunks.length;
+
+  post('STATUS', { text: `Embedding chunk 0 of ${total}…` });
 
   const embeddedChunks = [];
-  for (let i = 0; i < chunks.length; i++) {
+  for (let i = 0; i < total; i++) {
     const chunk = chunks[i];
     const embedding = await embedText(chunk);
-    embeddedChunks.push({ id: i, text: chunk, embedding });
+    const flyBits = flyHash(chunk);
+    embeddedChunks.push({ id: i, text: chunk, embedding, flyBits });
+    if ((i + 1) % 5 === 0 || i + 1 === total) {
+      post('STATUS', { text: `Embedding chunk ${i + 1} of ${total}…` });
+    }
   }
 
   state.chunks = embeddedChunks;
@@ -208,8 +253,7 @@ async function ask(payload, requestId) {
   const topK = Math.max(1, toFiniteInt(payload?.topK, 4));
   const coarseLimit = Math.min(state.chunks.length, Math.max(topK * 4, MIN_COARSE_CANDIDATES));
 
-  const coarse = state.chunks
-    .map((chunk) => ({ ...chunk, flyScore: flyScore(question, chunk.text) }))
+  const coarse = flyScoreAllChunks(question, state.chunks)
     .sort((a, b) => b.flyScore - a.flyScore)
     .slice(0, coarseLimit);
 

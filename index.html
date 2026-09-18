@@ -77,14 +77,20 @@
         return textEl;
       }
 
+      let receivedStatus = false;
       const engine = new FlyRAGSearchEngine({
         quiet: false,
         onProgress: ({ percent }) => {
           progressEl.textContent = `${Math.max(0, Math.min(100, Math.round(percent)))}%`;
         },
+        onStatus: ({ text }) => {
+          receivedStatus = true;
+          statusEl.textContent = text;
+        },
       });
 
       try {
+        if (!receivedStatus) statusEl.textContent = 'Initializing models…';
         await engine.initialize();
         statusEl.textContent = 'Engine initialized. Upload or paste text, then submit.';
         ingestBtn.disabled = false;
