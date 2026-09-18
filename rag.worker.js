@@ -144,20 +144,32 @@ async function initialize(payload) {
     }
     post('PROGRESS', { percent: 12 });
 
+    post('STATUS', { text: 'Downloading embedding model…' });
     state.embedder = await pipeline('feature-extraction', EMBEDDING_MODEL_ID, {
+      dtype: 'q8',
       progress_callback(progress) {
-        if (progress?.total == null || progress?.loaded == null || progress.total <= 0) return;
-        const ratio = progress.loaded / progress.total;
-        post('PROGRESS', { percent: toPercent(ratio, 12, 72) });
+        if (progress?.loaded == null) return;
+        if (progress.total != null && progress.total > 0) {
+          const ratio = progress.loaded / progress.total;
+          post('PROGRESS', { percent: toPercent(ratio, 12, 72) });
+        } else if (progress.loaded > 0) {
+          // Content-Length header unavailable — pulse progress so the UI doesn't appear stuck.
+          const MB = progress.loaded / (1024 * 1024);
+          // Asymptotically approach 70% as bytes accumulate (saturates around 100 MB).
+          const ratio = 1 - Math.exp(-MB / 30);
+          post('PROGRESS', { percent: toPercent(ratio, 12, 72) });
+        }
       },
     });
 
     post('PROGRESS', { percent: 74 });
+    post('STATUS', { text: 'Downloading language model…' });
 
     state.llm = await webllm.CreateMLCEngine(GENERATION_MODEL_ID, {
       initProgressCallback(progress) {
         const ratio = typeof progress?.progress === 'number' ? progress.progress : 0;
         post('PROGRESS', { percent: toPercent(ratio, 74, 100) });
+        if (progress?.text) post('STATUS', { text: progress.text });
       },
     });
 
@@ -182,12 +194,18 @@ async function initialize(payload) {
 async function loadDocuments(payload) {
   const text = payload?.text ?? '';
   const chunks = chunkText(text);
+  const total = chunks.length;
+
+  post('STATUS', { text: `Embedding chunk 0 of ${total}…` });
 
   const embeddedChunks = [];
-  for (let i = 0; i < chunks.length; i++) {
+  for (let i = 0; i < total; i++) {
     const chunk = chunks[i];
     const embedding = await embedText(chunk);
     embeddedChunks.push({ id: i, text: chunk, embedding });
+    if ((i + 1) % 5 === 0 || i + 1 === total) {
+      post('STATUS', { text: `Embedding chunk ${i + 1} of ${total}…` });
+    }
   }
 
   state.chunks = embeddedChunks;

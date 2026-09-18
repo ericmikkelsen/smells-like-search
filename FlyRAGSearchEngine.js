@@ -1,9 +1,10 @@
 const CHANNEL = 'FLYRAG_CORE';
 
 export class FlyRAGSearchEngine {
-  constructor({ quiet = false, workerUrl = './rag.worker.js', onProgress, wasmUrl, flyHashConfig } = {}) {
+  constructor({ quiet = false, workerUrl = './rag.worker.js', onProgress, onStatus, wasmUrl, flyHashConfig } = {}) {
     this.quiet = Boolean(quiet);
     this.onProgress = typeof onProgress === 'function' ? onProgress : null;
+    this.onStatus = typeof onStatus === 'function' ? onStatus : null;
     this.worker = new Worker(workerUrl, { type: 'module' });
 
     this.requestId = 1;
@@ -111,6 +112,11 @@ export class FlyRAGSearchEngine {
 
   #handleMessage(message) {
     if (!message || message.channel !== CHANNEL) return;
+
+    if (message.type === 'STATUS') {
+      if (this.onStatus) this.onStatus({ type: 'STATUS', text: String(message.text ?? '') });
+      return;
+    }
 
     if (message.type === 'PROGRESS') {
       if (this.onProgress) this.onProgress({ type: 'PROGRESS', percent: Number(message.percent ?? 0) });

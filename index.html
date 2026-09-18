@@ -82,9 +82,13 @@
         onProgress: ({ percent }) => {
           progressEl.textContent = `${Math.max(0, Math.min(100, Math.round(percent)))}%`;
         },
+        onStatus: ({ text }) => {
+          statusEl.textContent = text;
+        },
       });
 
       try {
+        statusEl.textContent = 'Initializing models…';
         await engine.initialize();
         statusEl.textContent = 'Engine initialized. Upload or paste text, then submit.';
         ingestBtn.disabled = false;
