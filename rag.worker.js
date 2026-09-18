@@ -7,6 +7,12 @@ const MIN_COARSE_CANDIDATES = 8;
 const EMBEDDING_MODEL_ID = 'Xenova/all-MiniLM-L6-v2';
 const GENERATION_MODEL_ID = 'Llama-3.2-3B-Instruct-q4f16_1-MLC';
 
+// Generation backend: 'nano' = Chrome Prompt API, 'webllm' = WebLLM/Llama
+const LLM_BACKEND = {
+  NANO: 'nano',
+  WEBLLM: 'webllm',
+};
+
 const state = {
   quiet: false,
   initialized: false,
@@ -19,6 +25,7 @@ const state = {
   hashBitWords: 0,
   embedder: null,
   llm: null,
+  llmBackend: null,
   chunks: [],
   initializing: null,
   initializingPayloadKey: null,
@@ -149,6 +156,16 @@ function rankByDenseSimilarity(queryEmbedding, candidates, topK) {
     .slice(0, topK);
 }
 
+async function checkNanoAvailable() {
+  try {
+    if (typeof self.ai?.languageModel?.capabilities !== 'function') return false;
+    const caps = await self.ai.languageModel.capabilities();
+    return caps?.available === 'readily' || caps?.available === 'after-download';
+  } catch {
+    return false;
+  }
+}
+
 async function initialize(payload) {
   state.quiet = Boolean(payload?.quiet);
   try {
@@ -187,18 +204,33 @@ async function initialize(payload) {
     });
 
     post('PROGRESS', { percent: 74 });
-    post('STATUS', { text: 'Downloading language model…' });
 
-    state.llm = await webllm.CreateMLCEngine(GENERATION_MODEL_ID, {
-      initProgressCallback(progress) {
-        const ratio = typeof progress?.progress === 'number' ? progress.progress : 0;
-        post('PROGRESS', { percent: toPercent(ratio, 74, 100) });
-        if (progress?.text) post('STATUS', { text: progress.text });
-      },
-    });
+    // Prefer Chrome's built-in Gemini Nano (Prompt API) if available.
+    const nanoAvailable = await checkNanoAvailable();
+    if (nanoAvailable) {
+      post('STATUS', { text: 'Using built-in Gemini Nano (Chrome Prompt API)…' });
+      // Create a reusable session with the RAG system prompt.
+      state.llm = await self.ai.languageModel.create({
+        systemPrompt:
+          'You are a retrieval-augmented assistant. Answer the question only using provided context. If context is insufficient, say so clearly.',
+      });
+      state.llmBackend = LLM_BACKEND.NANO;
+      post('PROGRESS', { percent: 100 });
+      post('STATUS', { text: 'Ready (Gemini Nano).' });
+    } else {
+      post('STATUS', { text: 'Downloading language model…' });
+      state.llm = await webllm.CreateMLCEngine(GENERATION_MODEL_ID, {
+        initProgressCallback(progress) {
+          const ratio = typeof progress?.progress === 'number' ? progress.progress : 0;
+          post('PROGRESS', { percent: toPercent(ratio, 74, 100) });
+          if (progress?.text) post('STATUS', { text: progress.text });
+        },
+      });
+      state.llmBackend = LLM_BACKEND.WEBLLM;
+      post('PROGRESS', { percent: 100 });
+    }
 
     state.initialized = true;
-    post('PROGRESS', { percent: 100 });
   } catch (error) {
     state.initialized = false;
     state.initializing = null;
@@ -212,6 +244,7 @@ async function initialize(payload) {
     state.hashBitWords = 0;
     state.embedder = null;
     state.llm = null;
+    state.llmBackend = null;
     state.chunks = [];
     throw error;
   }
@@ -264,32 +297,55 @@ async function ask(payload, requestId) {
     .map((item, idx) => `Context ${idx + 1}:\n${item.text}`)
     .join('\n\n');
 
-  const messages = [
-    {
-      role: 'system',
-      content:
-        'You are a retrieval-augmented assistant. Answer the question only using provided context. If context is insufficient, say so clearly.',
-    },
-    {
-      role: 'user',
-      content: `Question:\n${question}\n\nRetrieved context:\n${context}`,
-    },
-  ];
-
   let answer = '';
-  const stream = await state.llm.chat.completions.create({
-    messages,
-    temperature: 0.2,
-    max_tokens: 512,
-    stream: true,
-  });
 
-  for await (const part of stream) {
-    const token = part?.choices?.[0]?.delta?.content ?? '';
-    if (!token) continue;
+  if (state.llmBackend === LLM_BACKEND.NANO) {
+    // Chrome Prompt API — create a per-question session cloned from the system-prompt session.
+    const session = await self.ai.languageModel.create({
+      systemPrompt:
+        'You are a retrieval-augmented assistant. Answer the question only using provided context. If context is insufficient, say so clearly.',
+    });
+    try {
+      const prompt = `Question:\n${question}\n\nRetrieved context:\n${context}`;
+      const stream = await session.promptStreaming(prompt);
+      let previousLength = 0;
+      for await (const chunk of stream) {
+        const token = chunk.slice(previousLength);
+        previousLength = chunk.length;
+        if (!token) continue;
+        answer += token;
+        post('STREAM', { requestId, token });
+      }
+    } finally {
+      session.destroy();
+    }
+  } else {
+    const messages = [
+      {
+        role: 'system',
+        content:
+          'You are a retrieval-augmented assistant. Answer the question only using provided context. If context is insufficient, say so clearly.',
+      },
+      {
+        role: 'user',
+        content: `Question:\n${question}\n\nRetrieved context:\n${context}`,
+      },
+    ];
 
-    answer += token;
-    post('STREAM', { requestId, token });
+    const stream = await state.llm.chat.completions.create({
+      messages,
+      temperature: 0.2,
+      max_tokens: 512,
+      stream: true,
+    });
+
+    for await (const part of stream) {
+      const token = part?.choices?.[0]?.delta?.content ?? '';
+      if (!token) continue;
+
+      answer += token;
+      post('STREAM', { requestId, token });
+    }
   }
 
   return {
