@@ -6,6 +6,8 @@ const encoder = new TextEncoder();
 const MIN_COARSE_CANDIDATES = 8;
 const EMBEDDING_MODEL_ID = 'Xenova/all-MiniLM-L6-v2';
 const GENERATION_MODEL_ID = 'Llama-3.2-3B-Instruct-q4f16_1-MLC';
+const RAG_SYSTEM_PROMPT =
+  'You are a retrieval-augmented assistant. Answer the question only using provided context. If context is insufficient, say so clearly.';
 
 // Generation backend: 'nano' = Chrome Prompt API, 'webllm' = WebLLM/Llama
 const LLM_BACKEND = {
@@ -160,7 +162,7 @@ async function checkNanoAvailable() {
   try {
     if (typeof self.ai?.languageModel?.capabilities !== 'function') return false;
     const caps = await self.ai.languageModel.capabilities();
-    return caps?.available === 'readily' || caps?.available === 'after-download';
+    return caps?.available === 'readily';
   } catch {
     return false;
   }
@@ -208,12 +210,7 @@ async function initialize(payload) {
     // Prefer Chrome's built-in Gemini Nano (Prompt API) if available.
     const nanoAvailable = await checkNanoAvailable();
     if (nanoAvailable) {
-      post('STATUS', { text: 'Using built-in Gemini Nano (Chrome Prompt API)…' });
-      // Create a reusable session with the RAG system prompt.
-      state.llm = await self.ai.languageModel.create({
-        systemPrompt:
-          'You are a retrieval-augmented assistant. Answer the question only using provided context. If context is insufficient, say so clearly.',
-      });
+      // No session needed at init time; a fresh session is created per-question.
       state.llmBackend = LLM_BACKEND.NANO;
       post('PROGRESS', { percent: 100 });
       post('STATUS', { text: 'Ready (Gemini Nano).' });
@@ -300,11 +297,14 @@ async function ask(payload, requestId) {
   let answer = '';
 
   if (state.llmBackend === LLM_BACKEND.NANO) {
-    // Chrome Prompt API — create a per-question session cloned from the system-prompt session.
-    const session = await self.ai.languageModel.create({
-      systemPrompt:
-        'You are a retrieval-augmented assistant. Answer the question only using provided context. If context is insufficient, say so clearly.',
-    });
+    // Chrome Prompt API — create a fresh per-question session to avoid context bleed.
+    let session;
+    try {
+      session = await self.ai.languageModel.create({ systemPrompt: RAG_SYSTEM_PROMPT });
+    } catch (nanoError) {
+      // Nano became unavailable (e.g. model unloaded); surface a clear error.
+      throw new Error(`Gemini Nano session creation failed: ${nanoError instanceof Error ? nanoError.message : String(nanoError)}`);
+    }
     try {
       const prompt = `Question:\n${question}\n\nRetrieved context:\n${context}`;
       const stream = await session.promptStreaming(prompt);
@@ -316,16 +316,17 @@ async function ask(payload, requestId) {
         answer += token;
         post('STREAM', { requestId, token });
       }
+    } catch (streamError) {
+      throw new Error(`Gemini Nano generation failed: ${streamError instanceof Error ? streamError.message : String(streamError)}`);
     } finally {
       session.destroy();
     }
   } else {
+    if (!state.llm) {
+      throw new Error('Language model engine is not available.');
+    }
     const messages = [
-      {
-        role: 'system',
-        content:
-          'You are a retrieval-augmented assistant. Answer the question only using provided context. If context is insufficient, say so clearly.',
-      },
+      { role: 'system', content: RAG_SYSTEM_PROMPT },
       {
         role: 'user',
         content: `Question:\n${question}\n\nRetrieved context:\n${context}`,
